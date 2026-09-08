@@ -1,3 +1,5 @@
+> **Raspberry Pi UHF fork:** This branch backports upstream direct HTTP/HTTPS video playback to UxPlay 1.73.7. See [FORK.md](FORK.md) for provenance and known limitations, and the [Pi installation guide](docs/raspberry-pi-uhf.md) for setup and rollback. The original upstream documentation follows.
+
 # UxPlay 1.73: AirPlay-Mirror and AirPlay-Audio server for Linux, macOS, and Unix (also runs on Windows).
 
 ### **Now developed at the GitHub site <https://github.com/FDH2/UxPlay> (where ALL user issues should be posted, and latest versions can be found).**
