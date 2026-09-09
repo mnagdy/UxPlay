@@ -177,6 +177,7 @@ static bool h265_support = false;
 static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
+static bool hls_pi4 = false;
 static std::string lang = "";
 static std::string url = "";
 static guint gst_x11_window_id = 0;
@@ -917,6 +918,8 @@ static void print_info (char *name) {
     printf("          n=1,2,.. format = H264/5, ALAC/AAC. Default fn=\"recording\"\n");
     printf("-hls [v]  Support HTTP Live Streaming (HLS), Youtube app video only: \n");
     printf("          v = 2 or 3 (default 3) optionally selects video player version\n");
+    printf("-hls-pi4  Enable HLS; limit cached YouTube video to H.264/AAC-LC,\n");
+    printf("          up to 1920x1080 at 60 fps (direct HTTP streams unchanged)\n");
     printf("-lang xx  HLS language preferences (\"fr:es:..\", overrides $LANGUAGE)\n");
     printf("-lang     (or -lang 0): play undubbed HLS version (overrides $LANGUAGE)\n");
     printf("-scrsv n  Screensaver override n: 0=off 1=on while displaying video 2=always on\n");
@@ -1727,6 +1730,9 @@ static void parse_arguments (int argc, char *argv[]) {
                 }
                 playbin_version = (guint) n;
             }
+        } else if (arg == "-hls-pi4") {
+            hls_support = true;
+            hls_pi4 = true;
         } else if (arg == "-lang") {
             lang.erase();
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -2589,13 +2595,13 @@ extern "C" bool check_register(void *cls, const char *client_pk) {
 /* control  callbacks for video player (unimplemented) */
 
 extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
-    /* start_position needs to be implemented */
+    /* Register this request before rebuilding the renderer. */
     video_renderer_set_start(start_position);
     url.erase();
     url.append(location);
     relaunch_video = true;
     preserve_connections = true;
-    LOGI("********************on_video_play: location = %s*** start position %f ********************", url.c_str(), start_position);
+    LOGI("Direct playback: play request received; start position %.3f seconds", start_position);
     video_reset(cls, RESET_TYPE_ON_VIDEO_PLAY);
 }
 
@@ -2748,6 +2754,10 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     if (audiodelay >= 0) raop_set_plist(raop, "audio_delay_micros", audiodelay);
     if (pin_pw == 1) raop_set_plist(raop, "pin", (int) pin);
     if (hls_support) raop_set_plist(raop, "hls", 1);
+    if (hls_pi4) {
+        raop_set_plist(raop, "hls_pi4", 1);
+        LOGI("Cached YouTube HLS profile: Raspberry Pi 4, H.264/AAC-LC up to 1080p60");
+    }
 
     /* network port selection (ports listed as "0" will be dynamically assigned) */
     raop_set_tcp_ports(raop, tcp);
@@ -2861,6 +2871,17 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
     }
 }
 
+static void configure_stdout_buffering() {
+    /* Send complete log lines promptly when stdout is captured by systemd or a
+     * pipe. Configure this before any output, including the macOS wrapper. */
+#ifdef _WIN32
+    /* The Windows CRT treats _IOLBF as full buffering. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
+    setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
+#endif
+}
+
 #ifdef GST_MACOS
 /* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
 #include <TargetConditionals.h>
@@ -2868,6 +2889,7 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
 void real_main (int argc, char *argv[]);
 
 int main (int argc, char *argv[]) {
+    configure_stdout_buffering();
     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
 }
@@ -2875,6 +2897,7 @@ int main (int argc, char *argv[]) {
 void real_main (int argc, char *argv[]) {
 #else
 int main (int argc, char *argv[]) {
+    configure_stdout_buffering();
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";

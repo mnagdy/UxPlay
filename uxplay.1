@@ -23,6 +23,13 @@ UxPlay 1.73.7: An open\-source AirPlay mirroring (+ audio streaming) server:
 .IP
    v = 2 or 3 (default 3) optionally selects video player version
 .TP
+\fB\-hls-pi4\fR Enable HLS with the Raspberry Pi 4 compatibility profile.
+.IP
+   Cached YouTube variants must declare H.264 video and AAC-LC audio,
+   a resolution up to 1920x1080, and no frame rate above 60 fps.
+   Incompatible variants are removed before playback; no matching variant
+   causes playback to be rejected. Direct HTTP streams are unchanged.
+.TP
 \fB\-lang\fR xx  HLS language preferences ("fr:es:..", overrides $LANGUAGE)
 .TP
 \fB\-lang\fR    (or -lang 0): play undubbed HLS version (overrides $LANGUAGE)

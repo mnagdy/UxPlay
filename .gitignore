@@ -1,2 +1,5 @@
 build/
 .vscode/
+.pi-dev.json
+.pi-dev/
+__pycache__/

@@ -265,6 +265,60 @@ const char *get_playback_location(airplay_video_t *airplay_video) {
     return (const char *) (!airplay_video ? NULL : airplay_video->playback_location); 
 }
 
+static bool has_playlist_header(const char *playlist) {
+    if (!playlist || strncmp(playlist, "#EXTM3U", 7)) {
+        return false;
+    }
+    return playlist[7] == '\n' || playlist[7] == '\r' || playlist[7] == '\0';
+}
+
+bool airplay_video_is_ready(const airplay_video_t *airplay_video) {
+    if (!airplay_video || !airplay_video->playback_location ||
+        !airplay_video->playback_location[0]) {
+        return false;
+    }
+
+    const char *location = airplay_video->playback_location;
+    bool local_master = false;
+    if (airplay_video->local_uri_prefix) {
+        size_t prefix_len = strlen(airplay_video->local_uri_prefix);
+        if (!strncmp(location, airplay_video->local_uri_prefix, prefix_len)) {
+            const char *suffix = location + prefix_len;
+            size_t master_len = strlen("/master.m3u8");
+            local_master = !strncmp(suffix, "/master.m3u8", master_len) &&
+                           (suffix[master_len] == '\0' || suffix[master_len] == '?' ||
+                            suffix[master_len] == '#');
+        }
+    }
+
+    /* Ordinary UHF/Safari HTTP URLs bypass FCUP and have no playlist cache.
+     * Our local master location is assigned before its cache has been filled. */
+    if (!local_master && !airplay_video->uri_prefix &&
+        !airplay_video->master_playlist && !airplay_video->media_data_store &&
+        airplay_video->num_uri == 0) {
+        return !strncmp(location, "http://", 7) || !strncmp(location, "https://", 8);
+    }
+
+    if (!has_playlist_header(airplay_video->master_playlist) ||
+        !airplay_video->media_data_store || airplay_video->num_uri <= 0) {
+        return false;
+    }
+    for (int i = 0; i < airplay_video->num_uri; i++) {
+        const media_item_t *item = &airplay_video->media_data_store[i];
+        if (!item->uri || !item->uri[0] || item->num < 0 || item->num >= airplay_video->num_uri) {
+            return false;
+        }
+        /* Duplicate entries point directly at the first stored copy. Match the
+         * same one-hop resolution used by get_media_playlist(). */
+        const media_item_t *stored = &airplay_video->media_data_store[item->num];
+        if (!stored->uri || strcmp(item->uri, stored->uri) ||
+            !has_playlist_header(stored->playlist)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char *get_uri_prefix(airplay_video_t *airplay_video) {
     return (const char *) airplay_video->uri_prefix;
 }
@@ -283,6 +337,10 @@ char *get_uri_local_prefix(airplay_video_t *airplay_video) {
 
 int get_next_FCUP_RequestID(airplay_video_t *airplay_video) {    
     return ++(airplay_video->FCUP_RequestID);
+}
+
+int get_current_FCUP_RequestID(const airplay_video_t *airplay_video) {
+    return airplay_video->FCUP_RequestID;
 }
 
 void  set_next_media_uri_id(airplay_video_t *airplay_video, int num) {
@@ -631,7 +689,12 @@ int store_media_playlist(airplay_video_t *airplay_video, char * media_playlist, 
     /* dont store duplicate media paylists */
     for (int i = 0; i < num ; i++) {
         if (strcmp(media_data_store[i].uri, media_data_store[num].uri) == 0) {
-            assert(strcmp(media_data_store[i].playlist, media_playlist) == 0);
+            /* An earlier request for this URI may have failed. A later copy
+             * must still be stored, rather than dereferencing its NULL body. */
+            if (!media_data_store[i].playlist ||
+                strcmp(media_data_store[i].playlist, media_playlist)) {
+                continue;
+            }
             media_data_store[num].num = i;
             free (media_playlist);
             return 1;
@@ -646,19 +709,313 @@ int store_media_playlist(airplay_video_t *airplay_video, char * media_playlist, 
     return 0;
 }
 
-char * get_media_playlist(airplay_video_t *airplay_video, int *count, float *duration, const char *uri) {
-    media_item_t *media_data_store = airplay_video->media_data_store;
-    if (media_data_store == NULL) {
-        return NULL;
+static bool media_uri_matches(const airplay_video_t *video, const char *stored,
+                              const char *requested) {
+    if (!stored || !requested) return false;
+    if (!strcmp(stored, requested)) return true;
+    if (!video->uri_prefix || !video->local_uri_prefix) return false;
+    size_t original_len = strlen(video->uri_prefix);
+    if (strncmp(stored, video->uri_prefix, original_len)) return false;
+    const char *path = stored + original_len;
+    if (path[0] != '/') return false;
+    size_t local_len = strlen(video->local_uri_prefix);
+    if (!strncmp(requested, video->local_uri_prefix, local_len)) {
+        requested += local_len;
     }
-    for (int i = 0; i < airplay_video->num_uri; i++) {
-        if (strstr(media_data_store[i].uri, uri)) {
-            *count = media_data_store[media_data_store[i].num].count;
-            *duration = media_data_store[media_data_store[i].num].duration;
-            return media_data_store[media_data_store[i].num].playlist;
+    if (!strcmp(path, requested)) return true;
+    return path[0] == '/' && requested[0] != '/' && !strcmp(path + 1, requested);
+}
+
+static int available_media_index(const airplay_video_t *video, const char *uri) {
+    if (!video || !video->media_data_store) return -1;
+    for (int i = 0; i < video->num_uri; i++) {
+        const media_item_t *entry = &video->media_data_store[i];
+        if (!media_uri_matches(video, entry->uri, uri) ||
+            entry->num < 0 || entry->num >= video->num_uri) continue;
+        const media_item_t *stored = &video->media_data_store[entry->num];
+        if (stored->uri && !strcmp(entry->uri, stored->uri) &&
+            has_playlist_header(stored->playlist)) return entry->num;
+    }
+    return -1;
+}
+
+/* HLS attribute values may be quoted and contain commas (notably CODECS).
+ * Return a copy of exactly one named value, never a substring match. */
+static char *master_attribute(const char *line, const char *name) {
+    const char *p = strchr(line, ':');
+    if (!p) return NULL;
+    p++;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *key = p;
+        while (*p && *p != '=' && *p != ',') p++;
+        if (*p != '=') return NULL;
+        size_t key_len = (size_t) (p - key);
+        const char *value = ++p;
+        bool quoted = *p == '"';
+        if (quoted) value = ++p;
+        while (*p && (quoted ? *p != '"' : *p != ',')) p++;
+        if (quoted && *p != '"') return NULL;
+        size_t len = (size_t) (p - value);
+        if (key_len == strlen(name) && !memcmp(key, name, key_len)) {
+            char *copy = calloc(len + 1, 1);
+            if (copy) memcpy(copy, value, len);
+            return copy;
         }
+        if (quoted) p++;
+        if (*p && *p != ',') return NULL;
     }
     return NULL;
+}
+
+typedef struct {
+    char *text;
+    bool keep;
+    int media_index;
+    char *group;
+    char *type;
+} master_line_t;
+
+static bool available_group(master_line_t *lines, int count,
+                            const char *type, const char *group) {
+    for (int i = 0; i < count; i++) {
+        if (lines[i].keep && lines[i].group && lines[i].type &&
+            !strcmp(lines[i].group, group) && !strcmp(lines[i].type, type)) return true;
+    }
+    return false;
+}
+
+static bool bounded_unsigned(const char **cursor, unsigned limit, unsigned *result) {
+    const char *p = *cursor;
+    unsigned value = 0;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') {
+        unsigned digit = (unsigned) (*p++ - '0');
+        if (value > limit / 10 || (value == limit / 10 && digit > limit % 10)) return false;
+        value = value * 10 + digit;
+    }
+    *result = value;
+    *cursor = p;
+    return true;
+}
+
+static bool pi4_resolution_supported(const char *resolution) {
+    unsigned width, height;
+    const char *p = resolution;
+    return p && bounded_unsigned(&p, 1920, &width) && width > 0 && *p++ == 'x' &&
+           bounded_unsigned(&p, 1080, &height) && height > 0 && *p == '\0';
+}
+
+static bool pi4_frame_rate_supported(const char *rate) {
+    /* Parse HLS decimal syntax without locale dependence or float rounding at
+     * the 60fps boundary. Missing FRAME-RATE is allowed by the HLS format. */
+    if (!rate) return true;
+    unsigned whole;
+    if (!bounded_unsigned(&rate, 60, &whole)) return false;
+    bool fraction_nonzero = false;
+    if (*rate == '.') {
+        rate++;
+        if (*rate < '0' || *rate > '9') return false;
+        while (*rate >= '0' && *rate <= '9') {
+            if (*rate++ != '0') fraction_nonzero = true;
+        }
+    }
+    return !*rate && (whole || fraction_nonzero) && !(whole == 60 && fraction_nonzero);
+}
+
+static bool h264_codec(const char *codec) {
+    if (!strcmp(codec, "avc1") || !strcmp(codec, "avc3")) return true;
+    if (strlen(codec) != 11 || (strncmp(codec, "avc1.", 5) && strncmp(codec, "avc3.", 5))) return false;
+    for (int i = 5; i < 11; i++) {
+        char c = codec[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+static bool pi4_variant_supported(const char *line) {
+    char *codecs = master_attribute(line, "CODECS");
+    char *resolution = master_attribute(line, "RESOLUTION");
+    char *rate = master_attribute(line, "FRAME-RATE");
+    bool supported = codecs && pi4_resolution_supported(resolution) && pi4_frame_rate_supported(rate) &&
+                     (rate || !strstr(line, "FRAME-RATE="));
+    unsigned video_codecs = 0, audio_codecs = 0;
+    for (char *p = codecs; supported && p; ) {
+        char *comma = strchr(p, ',');
+        if (comma) *comma = '\0';
+        if (h264_codec(p)) video_codecs++;
+        else if (!strcmp(p, "mp4a.40.2")) audio_codecs++;
+        else supported = false;
+        p = comma ? comma + 1 : NULL;
+    }
+    free(codecs);
+    free(resolution);
+    free(rate);
+    return supported && video_codecs == 1 && audio_codecs == 1;
+}
+
+bool airplay_video_finalize_cache(airplay_video_t *video) {
+    return airplay_video_finalize_cache_profile(video, false);
+}
+
+bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
+    if (!video) return false;
+    if (!video->master_playlist && !video->media_data_store &&
+        airplay_video_is_ready(video)) return true; /* Direct HTTP playback. */
+    if (!has_playlist_header(video->master_playlist) ||
+        !video->media_data_store || video->num_uri <= 0) {
+        free(video->master_playlist);
+        video->master_playlist = NULL;
+        return false;
+    }
+
+    size_t length = strlen(video->master_playlist);
+    int count = 1;
+    for (const char *p = video->master_playlist; *p; p++) if (*p == '\n') count++;
+    master_line_t *lines = calloc((size_t) count, sizeof(*lines));
+    char *text = malloc(length + 1);
+    char *filtered = calloc(length + 2, 1);
+    bool *used = calloc((size_t) video->num_uri, sizeof(*used));
+    if (!lines || !text || !filtered || !used) {
+        free(lines); free(text); free(filtered); free(used);
+        free(video->master_playlist);
+        video->master_playlist = NULL;
+        return false;
+    }
+    memcpy(text, video->master_playlist, length + 1);
+    char *next = text;
+    bool missing_local_reference = false;
+    for (int i = 0; i < count; i++) {
+        lines[i].text = next;
+        lines[i].media_index = -1;
+        char *end = strchr(next, '\n');
+        if (end) { *end = '\0'; next = end + 1; }
+        size_t len = strlen(lines[i].text);
+        if (len && lines[i].text[len - 1] == '\r') lines[i].text[len - 1] = '\0';
+        lines[i].keep = lines[i].text[0] == '#';
+        if (!strncmp(lines[i].text, "#EXT-X-MEDIA:", 13) ||
+            !strncmp(lines[i].text, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
+            char *uri = master_attribute(lines[i].text, "URI");
+            if (uri) {
+                lines[i].media_index = available_media_index(video, uri);
+                lines[i].keep = lines[i].media_index >= 0;
+                free(uri);
+            } else if (strstr(lines[i].text, "URI=") ||
+                       !strncmp(lines[i].text, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
+                lines[i].keep = false; /* Malformed or missing required URI. */
+            }
+            if (!strncmp(lines[i].text, "#EXT-X-MEDIA:", 13)) {
+                lines[i].group = master_attribute(lines[i].text, "GROUP-ID");
+                lines[i].type = master_attribute(lines[i].text, "TYPE");
+            }
+        } else if (lines[i].text[0] == '#' && video->local_uri_prefix) {
+            /* Unknown tags may carry required resources (for example a
+             * session key). Do not silently remove their missing local URI. */
+            char *uri = master_attribute(lines[i].text, "URI");
+            if (!uri) uri = master_attribute(lines[i].text, "SERVER-URI");
+            size_t prefix_len = strlen(video->local_uri_prefix);
+            if (uri && !strncmp(uri, video->local_uri_prefix, prefix_len) && uri[prefix_len] == '/') {
+                lines[i].media_index = available_media_index(video, uri);
+                if (lines[i].media_index < 0) missing_local_reference = true;
+            }
+            free(uri);
+        }
+    }
+
+    int variants = 0;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
+        lines[i].keep = false;
+        if (pi4 && !pi4_variant_supported(lines[i].text)) continue;
+        int uri_line = i + 1;
+        while (uri_line < count && !lines[uri_line].text[0]) uri_line++;
+        if (uri_line >= count || lines[uri_line].text[0] == '#') continue;
+        int index = available_media_index(video, lines[uri_line].text);
+        if (index < 0) continue;
+        static const char *groups[] = { "AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS" };
+        bool playable = true;
+        for (size_t group = 0; group < sizeof(groups) / sizeof(groups[0]); group++) {
+            char *name = master_attribute(lines[i].text, groups[group]);
+            if (name && strcmp(name, "NONE") && !available_group(lines, count, groups[group], name)) {
+                playable = false;
+            }
+            free(name);
+        }
+        if (!playable) continue;
+        lines[i].keep = true;
+        lines[uri_line].keep = true;
+        lines[uri_line].media_index = index;
+        variants++;
+    }
+
+    if (pi4) {
+        /* Do not expose unused HE-AAC/other audio groups from variants removed
+         * above. Retain all available tracks within an actively used group. */
+        for (int i = 0; i < count; i++) {
+            if (!lines[i].keep || !lines[i].type || strcmp(lines[i].type, "AUDIO")) continue;
+            bool referenced = false;
+            for (int j = 0; j < count && !referenced; j++) {
+                if (!lines[j].keep || strncmp(lines[j].text, "#EXT-X-STREAM-INF:", 18)) continue;
+                char *group = master_attribute(lines[j].text, "AUDIO");
+                referenced = group && lines[i].group && !strcmp(group, lines[i].group);
+                free(group);
+            }
+            if (!referenced) lines[i].keep = false;
+        }
+    }
+
+    size_t written = 0;
+    for (int i = 0; i < count; i++) {
+        if (lines[i].keep) {
+            size_t len = strlen(lines[i].text);
+            memcpy(filtered + written, lines[i].text, len);
+            written += len;
+            filtered[written++] = '\n';
+            if (lines[i].media_index >= 0) used[lines[i].media_index] = true;
+        }
+        free(lines[i].group);
+        free(lines[i].type);
+    }
+    free(lines);
+    free(text);
+    int retained = 0;
+    for (int i = 0; i < video->num_uri; i++) if (used[i]) retained++;
+    media_item_t *compact = variants && retained && !missing_local_reference ?
+                           calloc((size_t) retained, sizeof(*compact)) : NULL;
+    if (!compact) {
+        free(filtered); free(used);
+        free(video->master_playlist);
+        video->master_playlist = NULL;
+        return false;
+    }
+    int target = 0;
+    for (int i = 0; i < video->num_uri; i++) {
+        if (used[i]) {
+            compact[target] = video->media_data_store[i];
+            compact[target].num = target;
+            target++;
+        } else {
+            free(video->media_data_store[i].uri);
+            free(video->media_data_store[i].playlist);
+        }
+    }
+    free(used);
+    free(video->media_data_store);
+    video->media_data_store = compact;
+    video->num_uri = retained;
+    video->next_uri = retained;
+    free(video->master_playlist);
+    video->master_playlist = filtered;
+    return airplay_video_is_ready(video);
+}
+
+char * get_media_playlist(airplay_video_t *airplay_video, int *count, float *duration, const char *uri) {
+    int index = available_media_index(airplay_video, uri);
+    if (index < 0) return NULL;
+    const media_item_t *entry = &airplay_video->media_data_store[index];
+    *count = entry->count;
+    *duration = entry->duration;
+    return entry->playlist;
 }
 
 char * get_media_uri_by_num(airplay_video_t *airplay_video, int num) {

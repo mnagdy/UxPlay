@@ -87,6 +87,7 @@ struct raop_s {
   
     /* activate support for HLS live streaming */
     bool hls_support;
+    bool hls_pi4;
     bool hls_pending;
   
     /* used in digest authentication */
@@ -766,6 +767,8 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
         raop->use_pin = true;
     } else if (strcmp(plist_item, "hls") == 0) {
         raop->hls_support = (value > 0 ? true : false);
+    } else if (strcmp(plist_item, "hls_pi4") == 0) {
+        raop->hls_pi4 = (value > 0);
     } else {
         retval = -1;
     }	  

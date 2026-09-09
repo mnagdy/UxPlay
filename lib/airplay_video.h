@@ -41,12 +41,22 @@ const char *get_uri_prefix(airplay_video_t *airplay_video);
 char *get_uri_local_prefix(airplay_video_t *airplay_video);
 void set_playback_location(airplay_video_t *airplay_video, const char *location, size_t len);
 const char *get_playback_location(airplay_video_t *airplay_video);
+/* A reusable direct URL, or a cached HLS master whose media playlists are all
+ * available. The FCUP request cursor alone does not establish readiness. */
+bool airplay_video_is_ready(const airplay_video_t *airplay_video);
+/* After FCUP collection ends, remove unavailable renditions/variants and keep
+ * only the media entries referenced by the surviving master. */
+bool airplay_video_finalize_cache(airplay_video_t *airplay_video);
+/* Opt-in Pi 4 selection: H.264 + AAC-LC, known dimensions <=1080p, <=60fps.
+ * This filters cached FCUP masters; direct HTTP URLs are left unchanged. */
+bool airplay_video_finalize_cache_profile(airplay_video_t *airplay_video, bool pi4);
 void set_language_code(airplay_video_t *airplay_video, const char *language_code, size_t len);
 const char *get_language_code(airplay_video_t *airplay_video);
 void set_language_name(airplay_video_t *airplay_video, const char *language_name, size_t len);
 const char *get_language_name(airplay_video_t *airplay_video);
 
-int get_next_FCUP_RequestID(airplay_video_t *airplay_video);    
+int get_next_FCUP_RequestID(airplay_video_t *airplay_video);
+int get_current_FCUP_RequestID(const airplay_video_t *airplay_video);
 void set_next_media_uri_id(airplay_video_t *airplay_video, int id);
 int get_next_media_uri_id(airplay_video_t *airplay_video);
 int get_num_media_uri(airplay_video_t *airplay_video);

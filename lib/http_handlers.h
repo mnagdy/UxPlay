@@ -401,7 +401,9 @@ http_handler_playback_info(raop_conn_t *conn, http_request_t *request, http_resp
         return;
     }      
 
-    playback_info.num_loaded_time_ranges = 1; 
+    /* A live stream has no finite total duration. Do not invent a negative
+     * loaded range by subtracting its advancing position from zero. */
+    playback_info.num_loaded_time_ranges = playback_info.duration > playback_info.position ? 1 : 0;
     time_range_t time_ranges_loaded[1];
     time_ranges_loaded[0].start = playback_info.position;
     time_ranges_loaded[0].duration = playback_info.duration - playback_info.position;
@@ -472,7 +474,8 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     bool data_is_plist = false;
     plist_t req_root_node = NULL;
     uint64_t uint_val = 0;
-    int request_id = 0;
+    uint64_t request_id = 0;
+    bool have_request_id = false;
     int fcup_response_statuscode = 0;
     char *type = NULL;
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
@@ -581,10 +584,14 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 
     } else if (!strcmp(type, "unhandledURLResponse")) {   
         /* handling type "unhandledURLResponse" */
+        if (airplay_video_is_ready(airplay_video)) {
+            /* A delayed duplicate final reply must not restart playback. */
+            goto post_action_done;
+        }
         uint_val = 0;
         int fcup_response_datalen = 0;
 
-        if  (logger_debug) {
+        {
             plist_t req_params_fcup_response_statuscode_node = plist_dict_get_item(req_params_node,
                                                                       "FCUP_Response_StatusCode");
             if (req_params_fcup_response_statuscode_node) {
@@ -597,12 +604,18 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 
             plist_t req_params_fcup_response_requestid_node = plist_dict_get_item(req_params_node,
                                                                      "FCUP_Response_RequestID");
-            if (req_params_fcup_response_requestid_node) {
-                plist_get_uint_val(req_params_fcup_response_requestid_node, &uint_val);
-                request_id = (int) uint_val;
-                uint_val = 0;
-                logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %d", request_id);
+            if (PLIST_IS_UINT(req_params_fcup_response_requestid_node)) {
+                plist_get_uint_val(req_params_fcup_response_requestid_node, &request_id);
+                have_request_id = true;
+                logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %" PRIu64, request_id);
             }
+        }
+        if (have_request_id && request_id != (uint64_t) get_current_FCUP_RequestID(airplay_video)) {
+            /* Consecutive entries can share a URL. An older failed response
+             * must not consume the later request for that same URL. */
+            logger_log(raop->logger, LOGGER_DEBUG,
+                       "Direct playback: ignoring superseded playlist response ID");
+            goto post_action_done;
         }
 
         plist_t req_params_fcup_response_url_node = plist_dict_get_item(req_params_node, "FCUP_Response_URL");
@@ -615,11 +628,39 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             goto post_action_error;
         }
         logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_URL =  %s", fcup_response_url);
+
+        /* Responses may arrive after a video was stopped or replaced. Match
+         * the outstanding URL before advancing the sequential download queue;
+         * otherwise an old reply can populate a different playlist's slot. */
+        int next_uri = get_next_media_uri_id(airplay_video);
+        const char *expected_uri = next_uri > 0 ?
+            get_media_uri_by_num(airplay_video, next_uri - 1) : NULL;
+        const char *prefix = get_uri_prefix(airplay_video);
+        bool expected_master = next_uri == 0 && prefix &&
+            !strncmp(fcup_response_url, prefix, strlen(prefix)) &&
+            !strcmp(fcup_response_url + strlen(prefix), "/master.m3u8");
+        if (!expected_master && (!expected_uri || strcmp(expected_uri, fcup_response_url))) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "Direct playback: ignoring a playlist response for a superseded request");
+            plist_mem_free(fcup_response_url);
+            goto post_action_done;
+        }
+        if (fcup_response_statuscode && fcup_response_statuscode != 200) {
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "Direct playback: %s playlist download failed (HTTP %d)",
+                       expected_master ? "master" : "media", fcup_response_statuscode);
+            plist_mem_free(fcup_response_url);
+            if (expected_master) goto post_action_error;
+            goto next_fcup_request;
+        }
 	
         plist_t req_params_fcup_response_data_node = plist_dict_get_item(req_params_node, "FCUP_Response_Data");
         if (!PLIST_IS_DATA(req_params_fcup_response_data_node)){
             plist_mem_free(fcup_response_url);
-            goto post_action_error;
+            if (expected_master) goto post_action_error;
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "Direct playback: skipping media playlist with no response data");
+            goto next_fcup_request;
         }
 
         uint_val = 0;
@@ -634,7 +675,10 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         char *playlist = NULL;
         if (!fcup_response_data) {
             plist_mem_free(fcup_response_url);
-            goto post_action_error;
+            if (expected_master) goto post_action_error;
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "Direct playback: skipping empty media playlist response");
+            goto next_fcup_request;
         } else {
             playlist = (char *) malloc(fcup_response_datalen + 1);
             if (!playlist) {
@@ -649,13 +693,19 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         }
         assert(playlist);
         int playlist_len = strlen(playlist);
+        if (strncmp(playlist, "#EXTM3U", 7)) {
+            logger_log(raop->logger, LOGGER_ERR, "Direct playback: invalid playlist response");
+            free(playlist);
+            plist_mem_free(fcup_response_url);
+            if (expected_master) goto post_action_error;
+            goto next_fcup_request;
+        }
     
         if (logger_debug) {
             logger_log(raop->logger, LOGGER_DEBUG, "begin FCUP Response data:\n%s\nend FCUP Response data", playlist);
         }
 
-        char *ptr = strstr(fcup_response_url, "/master.m3u8");
-        if (ptr) {
+        if (expected_master) {
             /* this is a master playlist */
             const char *uri_prefix = get_uri_prefix(airplay_video);
             char ** uri_list = NULL;
@@ -663,7 +713,16 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             char *uri_local_prefix = get_uri_local_prefix(airplay_video);
             playlist = select_master_playlist_language(airplay_video, playlist);
             playlist_len = strlen(playlist);
-            create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);	
+            int table_result = create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);
+            if (table_result || num_uri <= 0) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "Direct playback: master playlist contains no supported media routes");
+                for (int i = 0; i < num_uri; i++) free(uri_list[i]);
+                free(uri_list);
+                free(playlist);
+                plist_mem_free(fcup_response_url);
+                goto post_action_error;
+            }
             char *new_master = adjust_master_playlist (playlist, playlist_len,  uri_prefix, uri_local_prefix);
             free(playlist);
             store_master_playlist(airplay_video, new_master);
@@ -679,6 +738,11 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             int uri_num = get_next_media_uri_id(airplay_video);
             --uri_num;    // (next num is current num + 1)
             int ret = store_media_playlist(airplay_video, playlist, &count, &duration, &endlist, uri_num);
+            if (ret < 0) {
+                free(playlist);
+                plist_mem_free(fcup_response_url);
+                goto post_action_error;
+            }
             if (ret == 1) {
                 logger_log(raop->logger, LOGGER_DEBUG,"media_playlist is a duplicate: do not store");
             } else if (count) {
@@ -690,6 +754,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 
         plist_mem_free(fcup_response_url);
 
+ next_fcup_request:;
         int num_uri = get_num_media_uri(airplay_video);
         int uri_num = get_next_media_uri_id(airplay_video);
         if (uri_num <  num_uri) {
@@ -698,6 +763,15 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                                                              get_next_FCUP_RequestID(airplay_video));
             set_next_media_uri_id(airplay_video, ++uri_num);
         } else {
+            if (!airplay_video_finalize_cache_profile(airplay_video, raop->hls_pi4)) {
+                logger_log(raop->logger, LOGGER_ERR,
+                           "Direct playback: no playable variants in the downloaded playlist cache%s",
+                           raop->hls_pi4 ? " matching the Raspberry Pi 4 H.264/AAC-LC profile" : "");
+                goto post_action_error;
+            }
+            logger_log(raop->logger, LOGGER_INFO,
+                       "Direct playback: playlist cache ready (%d available entries)",
+                       get_num_media_uri(airplay_video));
             raop->callbacks.on_video_play(raop->callbacks.cls,
                                                 get_playback_location(airplay_video),
                                                 get_start_position_seconds(airplay_video));
@@ -707,6 +781,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     } else {
         logger_log(raop->logger, LOGGER_INFO, "unknown action type (unhandled)"); 
     }
+ post_action_done:;
     plist_mem_free(type);
     plist_free(req_root_node);
     return;
@@ -783,7 +858,9 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     int id = -1;
     id = get_playlist_by_uuid(raop, playback_uuid);
 
-    if (id >= 0 && !get_playback_location(raop->airplay_video[id])) {
+    if (id >= 0 && !airplay_video_is_ready(raop->airplay_video[id])) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "Direct playback: discarding incomplete playlist cache; fetching it again");
         raop_destroy_airplay_video(raop, id);
         id = -1;
     }

@@ -23,6 +23,8 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "video_renderer.h"
+#include "direct_playback_state.h"
+#include "playback_diagnostics.h"
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -53,6 +55,12 @@ static gboolean hls_seek_enabled = FALSE;
 static gboolean hls_playing = FALSE;
 static gboolean hls_buffer_empty = FALSE;
 static gboolean hls_buffer_full = FALSE;
+/* HTTP controls and the GLib bus/lifecycle run on different threads. */
+static GRecMutex direct_mutex;
+static direct_playback_state_t direct_state;
+static gboolean direct_request_pending = FALSE;
+static guint64 direct_generation = 0;
+static gint64 direct_requested_at = 0;
 static int type_264 = 0;
 static int type_265 = 0;
 static int type_hls = 0;
@@ -86,6 +94,9 @@ struct video_renderer_s {
     gboolean eos;
     gint64 duration;
     gint buffering_level;
+    guint64 direct_generation;
+    gboolean direct_started;
+    playback_diagnostics_t *diagnostics;
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -100,6 +111,28 @@ static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[]  = "hls";
 static char jpeg[] = "jpeg";
+
+/* Called with direct_mutex held. Buffering never changes requested intent. */
+static void direct_apply_state(void) {
+    if (!renderer || !hls_video || !renderer->direct_started || renderer->direct_generation != direct_generation) {
+        return;
+    }
+    direct_playback_target_t target = direct_playback_state_target(&direct_state);
+    GstState desired = target == DIRECT_PLAYBACK_PLAYING ? GST_STATE_PLAYING :
+                       target == DIRECT_PLAYBACK_PAUSED ? GST_STATE_PAUSED : GST_STATE_READY;
+    GstState current, pending;
+    gst_element_get_state(renderer->pipeline, &current, &pending, 0);
+    if (pending == desired || (current == desired && pending == GST_STATE_VOID_PENDING)) {
+        return;
+    }
+    GstStateChangeReturn result = gst_element_set_state(renderer->pipeline, desired);
+    if (result == GST_STATE_CHANGE_NO_PREROLL) {
+        direct_state.live = true;
+        if (direct_state.intent == DIRECT_PLAYBACK_PLAYING && desired == GST_STATE_PAUSED) {
+            gst_element_set_state(renderer->pipeline, GST_STATE_PLAYING);
+        }
+    }
+}
 
 static void append_videoflip (GString *launch, const videoflip_t *flip, const videoflip_t *rot) {
     /* videoflip image transform */
@@ -249,7 +282,7 @@ g_string_replace (GString     *string,
 }
 #endif
 
-void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
+static void video_renderer_init_unlocked(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
@@ -267,7 +300,15 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     hls_seek_end = -1;
     hls_duration = -1;
     hls_buffer_empty = TRUE;
-    hls_buffer_empty = FALSE;
+    hls_buffer_full = FALSE;
+    if (hls_video) {
+        if (!direct_request_pending) {
+            direct_playback_state_reset(&direct_state);
+            direct_requested_at = g_get_monotonic_time();
+            direct_generation++;
+        }
+        direct_request_pending = FALSE;
+    }
     type_hls = -1;
     type_264 = -1;
     type_265 = -1;
@@ -309,6 +350,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
         renderer_type[i]->uri = NULL;
         renderer_type[i]->eos = FALSE;
         if (hls_video) {
+            renderer_type[i]->direct_generation = direct_generation;
             renderer_type[i]->uri = (char *) calloc(strlen(uri) + 1, sizeof(char));
             memcpy(renderer_type[i]->uri, uri, strlen(uri));
             /* use playbin3 to play HLS video: replace "playbin3" by "playbin" to use playbin2 */
@@ -341,7 +383,8 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             flags |= GST_PLAY_FLAG_DOWNLOAD;
             flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
-            //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
+            renderer_type[i]->diagnostics = playback_diagnostics_attach(
+                renderer_type[i]->pipeline, logger, direct_requested_at);
         } else {
             bool jpeg_pipeline = false;
             if (i == type_264) {
@@ -484,7 +527,12 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     }
 }
 
-void video_renderer_pause() {
+static void video_renderer_pause_unlocked() {
+    if (hls_video || direct_request_pending) {
+        direct_state.intent = DIRECT_PLAYBACK_PAUSED;
+        direct_apply_state();
+        return;
+    }
     if (!renderer) {
         return;
     }
@@ -492,7 +540,12 @@ void video_renderer_pause() {
     logger_log(logger, LOGGER_DEBUG, "video renderer pause: %s", gst_element_state_change_return_get_name(ret));
 }
 
-void video_renderer_resume() {
+static void video_renderer_resume_unlocked() {
+    if (hls_video || direct_request_pending) {
+        direct_state.intent = DIRECT_PLAYBACK_PLAYING;
+        direct_apply_state();
+        return;
+    }
     if (!renderer) {
         return;
     }
@@ -507,13 +560,21 @@ void video_renderer_resume() {
     }
 }
 
-void video_renderer_start() {
+static void video_renderer_start_unlocked() {
     GstState state;
     const gchar *state_name = NULL;
     if (hls_video) {
+        if (direct_state.intent == DIRECT_PLAYBACK_STOPPED) {
+            return; /* A stop received during rebuilding cancels startup. */
+        }
         g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
-        gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
-	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        renderer->direct_started = TRUE;
+        GstStateChangeReturn initial = gst_element_set_state(renderer->pipeline, GST_STATE_PAUSED);
+        GstStateChangeReturn settled = gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        direct_state.live = initial == GST_STATE_CHANGE_NO_PREROLL || settled == GST_STATE_CHANGE_NO_PREROLL;
+        /* Asynchronous preroll is handled in bus order by ASYNC_DONE. */
+        direct_state.preroll_complete = initial == GST_STATE_CHANGE_SUCCESS;
+        direct_apply_state();
 	state_name = gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
         return;
@@ -665,10 +726,14 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
 void video_renderer_flush() {
 }
 
-void video_renderer_hls_ready() {
+static void video_renderer_hls_ready_unlocked() {
     GstState state;
     GstStateChangeReturn ret;
-    if (renderer && hls_video) {
+    if (hls_video || direct_request_pending) {
+        direct_state.intent = DIRECT_PLAYBACK_STOPPED;
+    }
+    if (renderer && hls_video && renderer->direct_generation == direct_generation) {
+        renderer->direct_started = FALSE;
         logger_log(logger, LOGGER_DEBUG,"video_renderer_hls_ready");
         ret = gst_element_set_state (renderer->pipeline, GST_STATE_READY);
         logger_log(logger, LOGGER_DEBUG,"pipeline_state_change_return: %s",
@@ -678,7 +743,11 @@ void video_renderer_hls_ready() {
     }
 }
 
-void video_renderer_stop() {
+static void video_renderer_stop_unlocked() {
+    if (hls_video) {
+        direct_state.intent = DIRECT_PLAYBACK_STOPPED;
+        if (renderer) renderer->direct_started = FALSE;
+    }
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
         if (renderer->appsrc) {
@@ -742,6 +811,8 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
             gst_object_unref (renderer->textsrc);
             renderer->textsrc = NULL;
         }	
+        playback_diagnostics_free(renderer->diagnostics);
+        renderer->diagnostics = NULL;
         gst_object_unref(renderer->bus);
         gst_object_unref(renderer->pipeline);
 #ifdef X_DISPLAY_FIX
@@ -760,12 +831,14 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
     }
 }
 
-void video_renderer_destroy() {
+static void video_renderer_destroy_unlocked() {
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
+            renderer_type[i] = NULL;
         }
     }
+    renderer = NULL;
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
@@ -810,7 +883,7 @@ static void hls_video_seek_to_start_position(GstElement *pipeline) {
     } 
 }
 
-static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
+static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstMessage *message, void *loop) {
     GstState old_state, new_state;
     const gchar no_state[] = "";
     const gchar *old_state_name = no_state, *new_state_name = no_state;
@@ -840,6 +913,10 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
     }
 
     video_renderer_t *renderer = renderer_type[type];
+    if (hls_video && renderer->direct_generation != direct_generation) {
+        return TRUE; /* A new /play request superseded this pipeline. */
+    }
+    playback_diagnostics_message(renderer->diagnostics, message);
 
     gint64 pos = -1;
     if (hls_video) {
@@ -889,21 +966,21 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
         if (hls_video) {
             gint percent = -1;
             gst_message_parse_buffering(message, &percent);
-            hls_buffer_empty = TRUE;
-            hls_buffer_full = FALSE;
-            if (percent > 0) {
-                hls_buffer_empty = FALSE;
+            if (direct_playback_state_buffer(&direct_state, percent)) {
+                hls_buffer_empty = percent == 0;
+                hls_buffer_full = percent == 100;
                 renderer->buffering_level = percent;
                 logger_log(logger, LOGGER_DEBUG, "Buffering :%d percent done", percent);
-                if (percent < 100) {
-                    gst_element_set_state (renderer->pipeline, GST_STATE_PAUSED);
-                } else {
-                    hls_buffer_full = TRUE;
-                    gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
-                }
+                direct_apply_state();
             }
         }
 	break;      
+    case GST_MESSAGE_ASYNC_DONE:
+        if (hls_video && GST_MESSAGE_SRC(message) == GST_OBJECT(renderer->pipeline)) {
+            direct_state.preroll_complete = true;
+            direct_apply_state();
+        }
+        break;
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
         gchar *debug = NULL;
@@ -940,13 +1017,15 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
         /* end-of-stream */
         logger_log(logger, LOGGER_INFO, "GStreamer: End-Of-Stream (video)");
         if (hls_video) {
+            direct_state.intent = DIRECT_PLAYBACK_STOPPED;
+            renderer->direct_started = FALSE;
             gst_bus_set_flushing(bus, TRUE);
             gst_element_set_state (renderer->pipeline, GST_STATE_READY);
             renderer->eos = TRUE;
         }
         break;
     case GST_MESSAGE_STATE_CHANGED:
-        if (hls_video && strstr(GST_MESSAGE_SRC_NAME(message), "hls-playbin")) {
+        if (hls_video && GST_MESSAGE_SRC(message) == GST_OBJECT(renderer->pipeline)) {
             GstState old_state, new_state;
             gst_message_parse_state_changed (message, &old_state, &new_state, NULL);
             if (logger_debug) {
@@ -959,6 +1038,9 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
                 break;
             } 
             hls_playing = TRUE;
+            if (!direct_state.buffering) {
+                hls_buffer_empty = FALSE;
+            }
             GstQuery *query = NULL;
             query = gst_query_new_seeking(GST_FORMAT_TIME);
                 if (gst_element_query(renderer->pipeline, query)) {
@@ -1092,7 +1174,7 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
 }
     
 
-bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full) {
+static bool video_get_playback_info_unlocked(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full) {
     gint64 pos = 0;
     GstState state;
     *duration = 0.0;
@@ -1100,11 +1182,13 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
     *seek_start = 0.0;
     *seek_duration = 0.0;
     *rate = 0.0f;
+    *buffer_empty = true;
+    *buffer_full = false;
     if (!renderer) {
         return true;
     }
 
-    if (hls_seek_enabled) {
+    if (hls_seek_enabled && hls_seek_start >= 0 && hls_seek_end >= hls_seek_start) {
         *seek_start = ((double) hls_seek_start) / GST_SECOND;
         *seek_duration = ((double) (hls_seek_end - hls_seek_start)) / GST_SECOND;     
     }
@@ -1121,16 +1205,14 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
     }
 
     if (!GST_CLOCK_TIME_IS_VALID(hls_duration)) {
-        if (!gst_element_query_duration (renderer->pipeline, GST_FORMAT_TIME, &hls_duration)) {
-            return true;
-        }
+        gst_element_query_duration(renderer->pipeline, GST_FORMAT_TIME, &hls_duration);
     }
-    *duration = ((double) hls_duration) / GST_SECOND;
-    if (*duration) {
-        if (gst_element_query_position (renderer->pipeline, GST_FORMAT_TIME, &pos) &&
-                                        GST_CLOCK_TIME_IS_VALID(pos)) {
-            *position = ((double) pos) / GST_SECOND;
-        }
+    if (hls_duration > 0) {
+        *duration = ((double) hls_duration) / GST_SECOND;
+    }
+    /* Live streams can report their position without a finite duration. */
+    if (gst_element_query_position(renderer->pipeline, GST_FORMAT_TIME, &pos) && pos >= 0) {
+        *position = ((double) pos) / GST_SECOND;
     }
 
     logger_log(logger, LOGGER_DEBUG, "******* video_get_playback_info: position %" GST_TIME_FORMAT " duration %" GST_TIME_FORMAT " %s rate %f *****",
@@ -1139,20 +1221,37 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
     return true;
 }
 
-void video_renderer_set_start(float position) {
-    int pos_in_micros = (int) (position * SECOND_IN_MICROSECS);
-    hls_requested_start_position = (gint64) (pos_in_micros * GST_USECOND);
+static void video_renderer_set_start_unlocked(float position) {
+    int64_t requested = 0;
+    direct_playback_seconds_to_ns(position, &requested);
+    hls_requested_start_position = requested;
+    direct_playback_state_reset(&direct_state);
+    direct_request_pending = TRUE;
+    direct_generation++;
+    direct_requested_at = g_get_monotonic_time();
     logger_log(logger, LOGGER_DEBUG, "register HLS video start position %f %lld", position,
                hls_requested_start_position);    
 }
 
-void video_renderer_seek(float position) {
-    int pos_in_micros = (int) (position * SECOND_IN_MICROSECS);
-    gint64 seek_position = (gint64) (pos_in_micros * GST_USECOND);
+static void video_renderer_seek_unlocked(float position) {
+    int64_t converted;
+    if (!renderer || !hls_video || renderer->direct_generation != direct_generation ||
+        !direct_playback_seconds_to_ns(position, &converted)) {
+        return;
+    }
+    gint64 seek_position = converted;
+    gint64 lower = 1000, upper;
     /* don't seek to within 1  microsecond  of beginning or end of video */
-    if (hls_duration < 2000) return;
-    seek_position =  seek_position < 1000 ? 1000 : seek_position;
-    seek_position =  seek_position > hls_duration  - 1000 ? hls_duration - 1000 : seek_position;
+    if (hls_duration >= 2000) {
+        upper = hls_duration - 1000;
+    } else if (hls_seek_enabled && hls_seek_start >= 0 && hls_seek_end > hls_seek_start &&
+               hls_seek_end - hls_seek_start >= 2000) {
+        lower = hls_seek_start + 1000;
+        upper = hls_seek_end - 1000;
+    } else {
+        return;
+    }
+    seek_position = CLAMP(seek_position, lower, upper);
     g_print("SCRUB: seek to %f secs =  %" GST_TIME_FORMAT ", duration = %" GST_TIME_FORMAT "\n", position,
             GST_TIME_ARGS(seek_position),  GST_TIME_ARGS(hls_duration));
     gboolean result = gst_element_seek_simple(renderer->pipeline, GST_FORMAT_TIME,
@@ -1160,10 +1259,17 @@ void video_renderer_seek(float position) {
                                               seek_position);
     if (result) {
         g_print("seek succeeded\n");
-        gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);	
+        direct_apply_state();
     } else {
         g_print("seek failed\n");
     }
+}
+
+static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
+    g_rec_mutex_lock(&direct_mutex);
+    gboolean result = gstreamer_video_pipeline_bus_callback_unlocked(bus, message, loop);
+    g_rec_mutex_unlock(&direct_mutex);
+    return result;
 }
 
 unsigned int video_renderer_listen(void *loop, int id) {
@@ -1173,19 +1279,82 @@ unsigned int video_renderer_listen(void *loop, int id) {
                                             gstreamer_video_pipeline_bus_callback, (gpointer) loop);    
 }
 
-bool video_renderer_eos_watch() {
-    if (hls_video && renderer->eos) {
+static bool video_renderer_eos_watch_unlocked() {
+    if (hls_video && renderer && renderer->direct_generation == direct_generation && renderer->eos) {
         renderer->eos = FALSE;
 	return true;
     }
     return false; 
 }
 
-void video_renderer_hls_set_volume(double volume) {
+static void video_renderer_hls_set_volume_unlocked(double volume) {
     if (!renderer || strcmp(renderer->codec, hls)) {
        return;
     }
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
     g_object_set(renderer->pipeline, "volume", volume, NULL);
+}
+
+/* Keep direct HTTP controls, bus handling and renderer lifetime serialized.
+ * Recursive locking allows existing lifecycle helpers to call one another.
+ */
+#define SERIALIZED_VOID0(name) \
+    void name(void) { \
+        g_rec_mutex_lock(&direct_mutex); \
+        name##_unlocked(); \
+        g_rec_mutex_unlock(&direct_mutex); \
+    }
+SERIALIZED_VOID0(video_renderer_pause)
+SERIALIZED_VOID0(video_renderer_resume)
+SERIALIZED_VOID0(video_renderer_start)
+SERIALIZED_VOID0(video_renderer_hls_ready)
+SERIALIZED_VOID0(video_renderer_stop)
+SERIALIZED_VOID0(video_renderer_destroy)
+#undef SERIALIZED_VOID0
+
+void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2],
+                         const char *parser, const char *rtp_pipeline, const char *decoder,
+                         const char *converter, const char *videosink, const char *videosink_options,
+                         bool initial_fullscreen, bool video_sync, bool h265_support,
+                         bool coverart_support, guint playbin_version, const char *uri) {
+    g_rec_mutex_lock(&direct_mutex);
+    video_renderer_init_unlocked(render_logger, server_name, videoflip, parser, rtp_pipeline,
+        decoder, converter, videosink, videosink_options, initial_fullscreen, video_sync,
+        h265_support, coverart_support, playbin_version, uri);
+    g_rec_mutex_unlock(&direct_mutex);
+}
+
+void video_renderer_set_start(float position) {
+    g_rec_mutex_lock(&direct_mutex);
+    video_renderer_set_start_unlocked(position);
+    g_rec_mutex_unlock(&direct_mutex);
+}
+
+void video_renderer_seek(float position) {
+    g_rec_mutex_lock(&direct_mutex);
+    video_renderer_seek_unlocked(position);
+    g_rec_mutex_unlock(&direct_mutex);
+}
+
+bool video_get_playback_info(double *duration, double *position, double *seek_start,
+                             double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full) {
+    g_rec_mutex_lock(&direct_mutex);
+    bool result = video_get_playback_info_unlocked(duration, position, seek_start, seek_duration,
+                                                  rate, buffer_empty, buffer_full);
+    g_rec_mutex_unlock(&direct_mutex);
+    return result;
+}
+
+bool video_renderer_eos_watch(void) {
+    g_rec_mutex_lock(&direct_mutex);
+    bool result = video_renderer_eos_watch_unlocked();
+    g_rec_mutex_unlock(&direct_mutex);
+    return result;
+}
+
+void video_renderer_hls_set_volume(double volume) {
+    g_rec_mutex_lock(&direct_mutex);
+    video_renderer_hls_set_volume_unlocked(volume);
+    g_rec_mutex_unlock(&direct_mutex);
 }

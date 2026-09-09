@@ -49,6 +49,7 @@ add_library( renderers
              STATIC
              audio_renderer.c
              video_renderer.c
+             playback_diagnostics.c
              mux_renderer.c )
 
 target_link_libraries ( renderers PUBLIC airplay )
@@ -88,6 +89,5 @@ elseif( CMAKE_VERSION VERSION_LESS "3.12" )
 else()		  
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
 endif()
-
 
 

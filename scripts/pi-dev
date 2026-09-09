@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Sync a Mac working tree, build on the Pi, and manage development releases."""
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+HELPER = ROOT / "scripts/pi_remote.py"
+CONFIG = ROOT / ".pi-dev.json"
+LOCAL_STATE = ROOT / ".pi-dev"
+
+
+def validate_host(host):
+    # Intentionally limited to SSH aliases, DNS names and IPv4, with optional user.
+    if not re.fullmatch(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*", host):
+        raise ValueError("Use an SSH alias or user@hostname / user@IPv4 for --host.")
+    return host
+
+
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(ROOT), *args])
+
+
+def snapshot(destination, release_id):
+    """Freeze tracked and nonignored new files; never sync local settings or .git."""
+    names = git("ls-files", "-z", "--cached", "--others", "--exclude-standard").split(b"\0")
+    digest = hashlib.sha256()
+    count = 0
+    for raw in sorted(set(names)):
+        if not raw:
+            continue
+        relative = Path(os.fsdecode(raw))
+        # Also exclude these when accidentally tracked.
+        if relative.parts[0] in {".git", ".pi-dev", ".pi-dev.json", "build", ".vscode"}:
+            continue
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Invalid source path: {relative}")
+        source = ROOT / relative
+        if source.is_symlink() or not source.resolve().is_relative_to(ROOT.resolve()):
+            raise ValueError(f"Source symlink is not supported by this sync helper: {relative}")
+        if not source.exists():
+            continue  # A tracked file deleted in the working tree must stay deleted.
+        if not source.is_file():
+            raise ValueError(f"Expected a source file: {relative}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        digest.update(raw + b"\0" + target.read_bytes() + b"\0")
+        count += 1
+    metadata = {
+        "release_id": release_id,
+        "revision": git("rev-parse", "HEAD").decode().strip(),
+        "dirty": bool(git("status", "--porcelain", "--untracked-files=normal")),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source_sha256": digest.hexdigest(),
+        "source_files": count,
+    }
+    (destination / ".pi-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    return metadata
+
+
+@contextmanager
+def local_lock():
+    LOCAL_STATE.mkdir(exist_ok=True)
+    with (LOCAL_STATE / "lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another development command is already running on this Mac.")
+        yield
+
+
+class Pi:
+    def __init__(self, host):
+        self.host = validate_host(host)
+        self.ssh = ["ssh", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
+                    "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"]
+        if not sys.stdin.isatty():
+            self.ssh += ["-o", "BatchMode=yes"]
+
+    def remote(self, action, *args, interactive=False, bootstrap=False):
+        if action == "logs":
+            tty = sys.stdin.isatty()
+            command = ["sudo"] + ([] if tty else ["-n"]) + [
+                "journalctl", "-u", "uxplay.service", "-b", "-n", "80", "--no-pager"]
+            subprocess.run(self.ssh + (["-t"] if tty else ["-T"]) +
+                           [self.host, shlex.join(command)], check=True)
+            return
+        tty = interactive and sys.stdin.isatty()
+        command = ["python3", "-" if bootstrap else "uxplay-dev/src/scripts/pi_remote.py",
+                   action, *args]
+        subprocess.run(self.ssh + (["-t"] if tty else ["-T"]) +
+                       [self.host, shlex.join(command)],
+                       input=HELPER.read_bytes() if bootstrap else None, check=True)
+
+    def sync(self, source):
+        # prepare verifies the dedicated root and holds the remote lock.
+        # Only this disposable source subtree is ever mirrored with --delete.
+        subprocess.run(["rsync", "-rltp", "--checksum", "--delete", "--itemize-changes",
+                        "-e", shlex.join(self.ssh), str(source) + "/",
+                        self.host + ":uxplay-dev/src/"], check=True)
+
+
+def run_workflow(pi, action):
+    if action in {"check", "logs"}:
+        pi.remote(action, bootstrap=True)
+        return
+
+    token = uuid.uuid4().hex
+    pi.remote("prepare", token, bootstrap=True)
+    try:
+        if action in {"build", "deploy"}:
+            revision = git("rev-parse", "--short=12", "HEAD").decode().strip()
+            dirty = "-dirty" if git("status", "--porcelain", "--untracked-files=normal") else ""
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            release_id = stamp + "-" + revision + dirty
+            with tempfile.TemporaryDirectory(prefix="uxplay-source-") as temp:
+                metadata = snapshot(Path(temp), release_id)
+                print(f"Sending {metadata['source_files']} source files; "
+                      f"snapshot {metadata['source_sha256'][:12]}", flush=True)
+                pi.sync(Path(temp))
+            pi.remote("build", token, release_id)
+            if action == "deploy":
+                pi.remote("activate", token, release_id, interactive=True)
+            else:
+                print(f"Built {release_id}. The service was not switched.")
+        else:
+            pi.remote(action, token, interactive=True)
+    finally:
+        try:
+            pi.remote("finish", token, bootstrap=True)
+        except subprocess.CalledProcessError:
+            print("Could not release the Pi lock. Reconnect and inspect "
+                  "~/uxplay-dev/state/lock before the next deployment.", file=sys.stderr)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["check", "build", "deploy", "logs", "rollback", "stable"])
+    parser.add_argument("--host", help="SSH alias or user@hostname; overrides .pi-dev.json")
+    args = parser.parse_args(argv)
+    try:
+        settings = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        host = args.host or os.environ.get("UXPLAY_PI_HOST") or settings.get("host")
+        if not host:
+            parser.error('Set --host user@projector.local or put {"host":"user@projector.local"} in .pi-dev.json.')
+        if shutil.which("ssh") is None or shutil.which("rsync") is None:
+            raise RuntimeError("This helper requires SSH and rsync on the Mac.")
+        with local_lock():
+            run_workflow(Pi(host), args.action)
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"pi-dev: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
