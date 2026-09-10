@@ -9,6 +9,8 @@
 #define httpd_get_connection_socket_by_type test_reverse_socket
 #include "../lib/raop.c"
 #undef httpd_get_connection_socket_by_type
+/* Inspect saved handshake state when malformed requests are rejected. */
+#include "../lib/fairplay_playfair.c"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -42,6 +44,7 @@ typedef struct {
     unsigned int play_calls;
     unsigned int reset_calls;
     float played_position;
+    bool expected_direct_http;
     char played_location[256];
 } fixture_t;
 
@@ -58,8 +61,9 @@ static void test_log(void *cls, int level, const char *message) {
     printf("%s\n", message);
 }
 
-static void played(void *cls, const char *location, const float position) {
+static void played(void *cls, const char *location, const float position, bool direct_http) {
     fixture_t *f = cls;
+    assert(direct_http == f->expected_direct_http);
     f->play_calls++;
     f->played_position = position;
     snprintf(f->played_location, sizeof(f->played_location), "%s", location);
@@ -119,7 +123,8 @@ static void expect_request(const char *expected_url) {
     }
 }
 
-static int invoke(fixture_t *f, raop_handler_t handler, const char *path, plist_t root) {
+static int invoke_request(fixture_t *f, raop_handler_t handler, const char *method,
+                          const char *protocol, const char *path, plist_t root) {
     char *body = NULL;
     uint32_t body_length = 0;
     plist_to_bin(root, &body, &body_length);
@@ -127,9 +132,9 @@ static int invoke(fixture_t *f, raop_handler_t handler, const char *path, plist_
     assert(body && body_length > 0);
     char header[512];
     int header_length = snprintf(header, sizeof(header),
-        "POST %s HTTP/1.1\r\nX-Apple-Session-ID: %s\r\n"
+        "%s %s %s\r\nX-Apple-Session-ID: %s\r\n"
         "Content-Type: application/x-apple-binary-plist\r\nContent-Length: %u\r\n\r\n",
-        path, session_id, body_length);
+        method, path, protocol, session_id, body_length);
     assert(header_length > 0 && header_length < (int)sizeof(header));
     http_request_t *request = http_request_init();
     assert(http_request_add_data(request, header, header_length) == 0);
@@ -138,18 +143,22 @@ static int invoke(fixture_t *f, raop_handler_t handler, const char *path, plist_
     assert(http_request_is_complete(request));
     assert(!http_request_has_error(request));
     http_response_t *response = http_response_create();
-    http_response_init(response, "HTTP/1.1", 200, "OK");
+    http_response_init(response, protocol, 200, "OK");
     char *response_body = NULL;
     int response_length = 0;
     handler(&f->conn, request, response, &response_body, &response_length);
     http_response_finish(response, response_body, response_length);
     const char *serialized = http_response_get_data(response, &response_length);
     int status = 0;
-    assert(sscanf(serialized, "HTTP/1.1 %d", &status) == 1);
+    assert(sscanf(serialized, "%*s %d", &status) == 1);
     free(response_body);
     http_response_destroy(response);
     http_request_destroy(request);
     return status;
+}
+
+static int invoke(fixture_t *f, raop_handler_t handler, const char *path, plist_t root) {
+    return invoke_request(f, handler, "POST", "HTTP/1.1", path, root);
 }
 
 static void play_request(fixture_t *f) {
@@ -160,6 +169,25 @@ static void play_request(fixture_t *f) {
     plist_dict_set_item(root, "clientProcName", plist_new_string("YouTube"));
     assert(invoke(f, http_handler_play, "/play", root) == 200);
     assert(f->reset_calls == 0);
+}
+
+static void test_direct_http_route_metadata(void) {
+    const char *locations[] = {"http://fixture.invalid/master.m3u8", "https://fixture.invalid/stream.m3u8"};
+    for (unsigned int i = 0; i < sizeof(locations) / sizeof(locations[0]); i++) {
+        fixture_t f;
+        fixture_init(&f);
+        f.expected_direct_http = true;
+        plist_t root = plist_new_dict();
+        plist_dict_set_item(root, "uuid", plist_new_string(playback_uuid));
+        plist_dict_set_item(root, "Content-Location", plist_new_string(locations[i]));
+        plist_dict_set_item(root, "Start-Position-Seconds", plist_new_real(3.5));
+        plist_dict_set_item(root, "clientProcName", plist_new_string("UHF"));
+        assert(invoke(&f, http_handler_play, "/play", root) == 200);
+        assert(f.play_calls == 1 && f.played_position == 3.5f);
+        assert(!strcmp(f.played_location, locations[i]));
+        expect_request(NULL);
+        fixture_destroy(&f);
+    }
 }
 
 static int action_response(fixture_t *f, const char *url, unsigned int id,
@@ -427,7 +455,257 @@ static void test_pi4_profile_reaches_download_finalizer(bool enabled) {
     fixture_destroy(&f);
 }
 
+typedef struct {
+    char text[4096];
+    size_t length;
+} lifecycle_log_t;
+
+static void lifecycle_log(void *cls, int level, const char *message) {
+    lifecycle_log_t *capture = cls;
+    (void)level;
+    assert(!strstr(message, "PRIVATE_TEARDOWN_FIXTURE"));
+    if (!strstr(message, "RAOP RTP audio trace ")) return;
+    /* logger_log serializes callbacks; reads below occur after the RTP join. */
+    size_t length = strlen(message);
+    assert(capture->length + length + 2 <= sizeof(capture->text));
+    memcpy(capture->text + capture->length, message, length);
+    capture->length += length;
+    capture->text[capture->length++] = '\n';
+    capture->text[capture->length] = '\0';
+}
+
+static plist_t audio_lifecycle_request(bool typed) {
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "privateMetadata", plist_new_string("PRIVATE_TEARDOWN_FIXTURE"));
+    if (typed) {
+        plist_t streams = plist_new_array();
+        plist_t stream = plist_new_dict();
+        plist_dict_set_item(stream, "type", plist_new_uint(96));
+        plist_dict_set_item(stream, "ct", plist_new_uint(2));
+        plist_dict_set_item(stream, "controlPort", plist_new_uint(0));
+        plist_array_append_item(streams, stream);
+        plist_dict_set_item(root, "streams", streams);
+    }
+    return root;
+}
+
+static void test_audio_teardown_lifecycle(void) {
+    /* Exercise real RTP start/join/restart through production plist handlers.
+     * No audio packets or timing traffic are sent; the deadline bounds joins. */
+    alarm(10);
+    fixture_t f;
+    fixture_init(&f);
+    lifecycle_log_t capture = {{0}, 0};
+    logger_set_callback(f.raop.logger, lifecycle_log, &capture);
+    httpd_callbacks_t http_callbacks = {0};
+    f.raop.httpd = httpd_init(f.raop.logger, &http_callbacks, 0);
+    assert(f.raop.httpd);
+    timing_protocol_t timing = NTP;
+    f.conn.raop_ntp = raop_ntp_init(f.raop.logger, &f.raop.callbacks, "127.0.0.1", 4, 0, &timing);
+    assert(f.conn.raop_ntp);
+    unsigned char aeskey[16] = {0}, aesiv[16] = {0};
+    f.conn.raop_rtp = raop_rtp_init(f.raop.logger, &f.raop.callbacks, f.conn.raop_ntp,
+                                     "127.0.0.1", 4, aeskey, aesiv);
+    assert(f.conn.raop_rtp);
+    raop_rtp_t *original_rtp = f.conn.raop_rtp;
+    assert(invoke_request(&f, raop_handler_setup, "SETUP", "RTSP/1.0", "/fixture",
+                          audio_lifecycle_request(true)) == 200);
+    assert(raop_rtp_is_running(original_rtp));
+    uint64_t generation = raop_rtp_get_trace_generation(original_rtp);
+    assert(generation > 0);
+
+    assert(invoke_request(&f, raop_handler_teardown, "TEARDOWN", "RTSP/1.0", "/fixture",
+                          audio_lifecycle_request(true)) == 200);
+    assert(f.conn.raop_rtp == original_rtp);
+    assert(!raop_rtp_is_running(original_rtp));
+    assert(raop_rtp_get_trace_generation(original_rtp) == generation);
+    assert(strstr(capture.text, "event=teardown-request audio=1 video=0 rtp_present=1"));
+    assert(strstr(capture.text, "event=stop-request reason=sender-teardown-audio"));
+    assert(strstr(capture.text, "event=stopped "));
+    memset(&capture, 0, sizeof(capture));
+
+    /* A typed audio teardown retains the object for a later audio SETUP. */
+    assert(invoke_request(&f, raop_handler_setup, "SETUP", "RTSP/1.0", "/fixture",
+                          audio_lifecycle_request(true)) == 200);
+    assert(f.conn.raop_rtp == original_rtp);
+    assert(raop_rtp_is_running(original_rtp));
+    assert(raop_rtp_get_trace_generation(original_rtp) > generation);
+    assert(invoke_request(&f, raop_handler_teardown, "TEARDOWN", "RTSP/1.0", "/fixture",
+                          audio_lifecycle_request(false)) == 200);
+    assert(f.conn.raop_rtp == NULL);
+    assert(strstr(capture.text, "event=teardown-request audio=0 video=0 rtp_present=1"));
+    assert(strstr(capture.text, "event=stop-request reason=sender-teardown-session"));
+    assert(strstr(capture.text, "event=stopped "));
+    assert(!strstr(capture.text, "reason=sender-teardown-audio"));
+
+    raop_ntp_destroy(f.conn.raop_ntp);
+    f.conn.raop_ntp = NULL;
+    httpd_destroy(f.raop.httpd);
+    f.raop.httpd = NULL;
+    fixture_destroy(&f);
+    alarm(0);
+    puts("RAOP teardown: typed audio stop/restart and full session destruction passed.");
+}
+
+static void test_server_info_preserves_legacy_http_features(void) {
+    fixture_t f;
+    fixture_init(&f);
+    int error = 0;
+    const char address[6] = {2, 0, 0, 0, 0, 1};
+    f.raop.dnssd = dnssd_init("fixture", 7, address, sizeof(address), &error, 0);
+    assert(f.raop.dnssd && error == DNSSD_ERROR_NOERROR);
+    for (int i = 0; i < 3; i++) {
+        if (i) {
+            dnssd_set_airplay_features(f.raop.dnssd, 3, 0);
+            dnssd_set_airplay_features(f.raop.dnssd, 42, i == 1);
+        }
+        http_response_t *response = http_response_create();
+        http_response_init(response, "HTTP/1.1", 200, "OK");
+        char *body = NULL;
+        int length = 0;
+        http_handler_server_info(&f.conn, NULL, response, &body, &length);
+        assert(body && length > 0);
+        plist_t root = NULL;
+        plist_from_xml(body, length, &root);
+        assert(PLIST_IS_DICT(root));
+        plist_t value = plist_dict_get_item(root, "features");
+        assert(PLIST_IS_UINT(value));
+        uint64_t features = 0;
+        plist_get_uint_val(value, &features);
+        /* The modern RAOP mask makes iOS select HTTP /fp-setup, which this
+         * receiver does not implement. Preserve its working legacy HLS path
+         * even when RAOP/mirroring features include upper-word bits. */
+        assert(features == UINT64_C(0x27F));
+        assert(!(features & (UINT64_C(1) << 42)));
+        char *model = NULL;
+        plist_get_string_val(plist_dict_get_item(root, "model"), &model);
+        assert(model && !strcmp(model, GLOBAL_MODEL));
+        plist_mem_free(model);
+        plist_free(root);
+        free(body);
+        http_response_destroy(response);
+    }
+    dnssd_destroy(f.raop.dnssd);
+    fixture_destroy(&f);
+}
+
+static void assert_handshake_unchanged(fairplay_t *fp, const unsigned char handshake[164]) {
+    assert(fp->keymsglen == 164);
+    assert(!memcmp(fp->keymsg, handshake, 164));
+}
+
+static void test_fairplay_setup_bounds(void) {
+    fairplay_t *fp = fairplay_init(NULL);
+    assert(fp);
+    unsigned char setup[16] = {0}, response[142];
+    setup[4] = 3;
+    /* Golden hashes lock all existing response bytes for each supported mode. */
+    const uint64_t expected[] = {UINT64_C(0x3d8e4e02084b2887), UINT64_C(0xc7ba827810db9176),
+                                 UINT64_C(0xe5b4faf447ecd35f), UINT64_C(0xf6928fb6c9c9cd28)};
+    unsigned char handshake[164], handshake_response[32];
+    for (unsigned int i = 0; i < sizeof(handshake); i++) handshake[i] = (unsigned char)i;
+    handshake[4] = 3;
+    for (unsigned int mode = 0; mode < 4; mode++) {
+        assert(!fairplay_handshake(fp, handshake, handshake_response));
+        setup[14] = mode;
+        assert(!fairplay_setup(fp, setup, response));
+        assert(fp->keymsglen == 0);
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (unsigned int i = 0; i < sizeof(response); i++)
+            hash = (hash ^ response[i]) * UINT64_C(1099511628211);
+        assert(hash == expected[mode]);
+    }
+    assert(!fairplay_handshake(fp, handshake, handshake_response));
+    const unsigned char header[] = {'F', 'P', 'L', 'Y', 3, 1, 4, 0, 0, 0, 0, 20};
+    assert(!memcmp(handshake_response, header, sizeof(header)));
+    assert(!memcmp(handshake_response + sizeof(header), handshake + 144, 20));
+    assert_handshake_unchanged(fp, handshake);
+    for (unsigned int mode = 4; mode <= 255; mode++) {
+        setup[14] = mode;
+        memset(response, 0xa5, sizeof(response));
+        assert(fairplay_setup(fp, setup, response) == -1);
+        for (unsigned int i = 0; i < sizeof(response); i++) assert(response[i] == 0xa5);
+        assert_handshake_unchanged(fp, handshake);
+    }
+    /* Unsupported versions still reject without overwriting output or state. */
+    setup[14] = 0;
+    setup[4] = 2;
+    assert(fairplay_setup(fp, setup, response) == -1);
+    for (unsigned int i = 0; i < sizeof(response); i++) assert(response[i] == 0xa5);
+    unsigned char unsupported[164];
+    memcpy(unsupported, handshake, sizeof(unsupported));
+    unsupported[4] = 2;
+    memset(handshake_response, 0xa5, sizeof(handshake_response));
+    assert(fairplay_handshake(fp, unsupported, handshake_response) == -1);
+    for (unsigned int i = 0; i < sizeof(handshake_response); i++) assert(handshake_response[i] == 0xa5);
+    assert_handshake_unchanged(fp, handshake);
+    fairplay_destroy(fp);
+}
+
+static void invoke_rejected_fairplay(fixture_t *f, raop_handler_t handler, const char *protocol,
+                                     const char *path, const unsigned char *body, int length,
+                                     int expected_status) {
+    char header[256];
+    int header_length = snprintf(header, sizeof(header),
+        "POST %s %s\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n",
+        path, protocol, length);
+    assert(header_length > 0 && header_length < (int)sizeof(header));
+    http_request_t *request = http_request_init();
+    assert(!http_request_add_data(request, header, header_length));
+    if (length) assert(!http_request_add_data(request, (const char *)body, length));
+    assert(http_request_is_complete(request) && !http_request_has_error(request));
+    http_response_t *response = http_response_create();
+    http_response_init(response, protocol, 200, "OK");
+    char *response_body = NULL;
+    int response_length = 0;
+    handler(&f->conn, request, response, &response_body, &response_length);
+    assert(!response_body && response_length == 0);
+    http_response_finish(response, response_body, response_length);
+    const char *serialized = http_response_get_data(response, &response_length);
+    int status = 0;
+    assert(sscanf(serialized, "%*s %d", &status) == 1 && status == expected_status);
+    http_response_destroy(response);
+    http_request_destroy(request);
+}
+
+static void test_fairplay_request_lengths(void) {
+    fixture_t f;
+    fixture_init(&f);
+    f.conn.fairplay = fairplay_init(f.raop.logger);
+    assert(f.conn.fairplay);
+    unsigned char body[165] = {0}, response[32];
+    body[4] = 3;
+    assert(!fairplay_handshake(f.conn.fairplay, body, response));
+    const int malformed[] = {0, 1, 2, 3, 4, 5, 15, 17, 163, 165};
+    for (unsigned int i = 0; i < sizeof(malformed) / sizeof(malformed[0]); i++) {
+        /* Existing RTSP setup length validation must continue guarding its
+         * fixed-size FairPlay calls before they can read request fields. */
+        invoke_rejected_fairplay(&f, raop_handler_fpsetup, "RTSP/1.0", "/fp-setup",
+                                body, malformed[i], 200);
+        assert_handshake_unchanged(f.conn.fairplay, body);
+    }
+    const int unsupported_http[] = {0, 1, 2, 3, 4, 5, 16, 164};
+    for (unsigned int i = 0; i < sizeof(unsupported_http) / sizeof(unsupported_http[0]); i++) {
+        invoke_rejected_fairplay(&f, http_handler_fpsetup2, "HTTP/1.1", "/fp-setup2",
+                                body, unsupported_http[i], 421);
+        assert_handshake_unchanged(f.conn.fairplay, body);
+    }
+    body[14] = 255;
+    invoke_rejected_fairplay(&f, raop_handler_fpsetup, "RTSP/1.0", "/fp-setup", body, 16, 200);
+    body[14] = 0;
+    assert_handshake_unchanged(f.conn.fairplay, body);
+    assert(f.play_calls == 0 && f.reset_calls == 0 && f.raop.current_video == -1);
+    expect_request(NULL);
+    fairplay_destroy(f.conn.fairplay);
+    fixture_destroy(&f);
+}
+
 int main(void) {
+    test_fairplay_setup_bounds();
+    test_fairplay_request_lengths();
+    test_server_info_preserves_legacy_http_features();
+    test_audio_teardown_lifecycle();
+    test_direct_http_route_metadata();
     test_partial_cache_never_resumes();
     test_complete_cache_resumes_without_refetch();
     test_stale_responses_do_not_advance_collection();

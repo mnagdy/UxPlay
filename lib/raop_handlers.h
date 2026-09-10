@@ -1277,12 +1277,21 @@ raop_handler_teardown(raop_conn_t *conn,
     }
     plist_free(req_root_node);
     logger_log(raop->logger, LOGGER_DEBUG, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
+    logger_log(raop->logger, LOGGER_INFO,
+               "RAOP RTP audio trace rtp_generation=%" PRIu64
+               " event=teardown-request audio=%d video=%d rtp_present=%d",
+               conn->raop_rtp ? raop_rtp_get_trace_generation(conn->raop_rtp) : UINT64_C(0),
+               teardown_96 ? 1 : 0, teardown_110 ? 1 : 0, conn->raop_rtp ? 1 : 0);
   
     http_response_add_header(response, "Connection", "close");
   
     if (teardown_96) {
         if (conn->raop_rtp) {
             /* Stop our audio RTP session */
+            logger_log(raop->logger, LOGGER_INFO,
+                       "RAOP RTP audio trace rtp_generation=%" PRIu64
+                       " event=stop-request reason=sender-teardown-audio",
+                       raop_rtp_get_trace_generation(conn->raop_rtp));
             raop_rtp_stop(conn->raop_rtp);
             /* stop any  coverart rendering */
             if (raop->callbacks.audio_stop_coverart_rendering) {
@@ -1302,6 +1311,10 @@ raop_handler_teardown(raop_conn_t *conn,
     } else {
         /* Destroy our sessions */
         if (conn->raop_rtp) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "RAOP RTP audio trace rtp_generation=%" PRIu64
+                       " event=stop-request reason=sender-teardown-session",
+                       raop_rtp_get_trace_generation(conn->raop_rtp));
             raop_rtp_destroy(conn->raop_rtp);
             conn->raop_rtp = NULL;
         }

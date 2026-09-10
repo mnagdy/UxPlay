@@ -25,6 +25,7 @@
 #include "video_renderer.h"
 #include "direct_playback_state.h"
 #include "playback_diagnostics.h"
+#include "hls_gap_repair.h"
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -97,6 +98,10 @@ struct video_renderer_s {
     guint64 direct_generation;
     gboolean direct_started;
     playback_diagnostics_t *diagnostics;
+    hls_gap_repair_t *gap_repair;
+    gboolean gap_only_audio;
+    GstClockTime startup_buffer_time;
+    gulong buffering_handler;
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -111,13 +116,89 @@ static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[]  = "hls";
 static char jpeg[] = "jpeg";
+static gboolean pi4_profile = FALSE;
+static gboolean direct_http_source = FALSE;
+
+void video_renderer_configure_pi4(logger_t *profile_logger) {
+    pi4_profile = TRUE;
+    /* The Pi 4 stateless HEVC driver can wait indefinitely for an IRQ during
+     * STREAMOFF. Once that happens, even SIGKILL cannot reclaim the decoder,
+     * and the renderer's teardown prevents later H.264 sessions from starting.
+     * Exclude this exact factory before decodebin caches its candidate list.
+     * This changes only this process, leaving H.264 acceleration available. */
+    GstElementFactory *hardware = gst_element_factory_find("v4l2slh265dec");
+    if (hardware) {
+        gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(hardware), GST_RANK_NONE);
+        gst_object_unref(hardware);
+    }
+    GstElementFactory *software = gst_element_factory_find("avdec_h265");
+    logger_log(profile_logger, software ? LOGGER_INFO : LOGGER_WARNING,
+               "Pi 4 profile: excluded v4l2slh265dec to avoid HEVC driver shutdown hangs; "
+               "software_hevc_available=%d; H.264 decoder selection unchanged", software != NULL);
+    if (software) gst_object_unref(software);
+}
+
+static void configure_direct_buffering(GstBin *pipeline, GstBin *parent,
+                                        GstElement *element, gpointer data) {
+    (void)pipeline;
+    (void)parent;
+    video_renderer_t *owner = data;
+    GstElementFactory *factory = gst_element_get_factory(element);
+    if (!factory || !owner->startup_buffer_time ||
+        strcmp(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)), "hlsdemux2")) return;
+    GParamSpec *property = g_object_class_find_property(G_OBJECT_GET_CLASS(element), "low-watermark-time");
+    if (!property || G_PARAM_SPEC_VALUE_TYPE(property) != G_TYPE_UINT64 ||
+        !(property->flags & G_PARAM_WRITABLE)) return;
+    /* Direct sources can publish one short live fragment at a time. Waiting
+     * for the adaptive demuxer's default ten seconds can require multiple
+     * publication cycles. Keep its 30s download ceiling and ordinary buffering
+     * state machine, but allow this Pi profile to start with three seconds.
+     * Cached YouTube playback retains its existing buffering configuration. */
+    g_object_set(element, "low-watermark-time", (guint64)owner->startup_buffer_time, NULL);
+    logger_log(logger, LOGGER_INFO, "Direct playback: session=%" G_GUINT64_FORMAT
+               " stage=buffering-profile route=direct-http minimum_ms=%" G_GUINT64_FORMAT,
+               owner->direct_generation, owner->startup_buffer_time / GST_MSECOND);
+}
+
+/* Called with direct_mutex held from the main-loop bus watch or a serialized
+ * control, never a streaming pad callback. Keep the renderer shell for normal
+ * replacement, but release the failed pipeline's downloads and decoders. */
+static void direct_fail_session(video_renderer_t *owner) {
+    if (!hls_video || owner->direct_generation != direct_generation || direct_state.failed) return;
+    direct_playback_state_fail(&direct_state);
+    owner->direct_started = FALSE;
+    owner->eos = FALSE;
+    owner->gap_only_audio = FALSE;
+    hls_playing = FALSE;
+    hls_buffer_empty = TRUE;
+    hls_buffer_full = FALSE;
+    hls_seek_enabled = FALSE;
+    hls_requested_start_position = 0;
+    GstStateChangeReturn result = gst_element_set_state(owner->pipeline, GST_STATE_NULL);
+    logger_log(logger, LOGGER_INFO, "Direct playback: session=%" G_GUINT64_FORMAT
+               " stage=failed action=stop state=NULL result=%s", direct_generation,
+               gst_element_state_change_return_get_name(result));
+}
 
 /* Called with direct_mutex held. Buffering never changes requested intent. */
 static void direct_apply_state(void) {
-    if (!renderer || !hls_video || !renderer->direct_started || renderer->direct_generation != direct_generation) {
+    if (!renderer || !hls_video || direct_state.failed || !renderer->direct_started ||
+        renderer->direct_generation != direct_generation) {
         return;
     }
     direct_playback_target_t target = direct_playback_state_target(&direct_state);
+    gboolean gap_only = hls_gap_repair_gap_only_audio(renderer->gap_repair);
+    if (gap_only != renderer->gap_only_audio) {
+        renderer->gap_only_audio = gap_only;
+        logger_log(logger, LOGGER_INFO, "Direct playback: session=%" G_GUINT64_FORMAT
+                   " stage=gap-only-audio active=%d", direct_generation, gap_only);
+    }
+    /* Until the first real audio sample, decodebin3 has no audio sink to hold
+     * timed GAP events. Its empty adaptive audio queue cannot describe video
+     * readiness. The GAP events still bound demux output to completed media;
+     * resume normal buffering as soon as real audio arrives. */
+    if (gap_only && direct_state.preroll_complete && direct_state.intent == DIRECT_PLAYBACK_PLAYING)
+        target = DIRECT_PLAYBACK_PLAYING;
     GstState desired = target == DIRECT_PLAYBACK_PLAYING ? GST_STATE_PLAYING :
                        target == DIRECT_PLAYBACK_PAUSED ? GST_STATE_PAUSED : GST_STATE_READY;
     GstState current, pending;
@@ -126,6 +207,10 @@ static void direct_apply_state(void) {
         return;
     }
     GstStateChangeReturn result = gst_element_set_state(renderer->pipeline, desired);
+    if (result == GST_STATE_CHANGE_FAILURE) {
+        direct_fail_session(renderer);
+        return;
+    }
     if (result == GST_STATE_CHANGE_NO_PREROLL) {
         direct_state.live = true;
         if (direct_state.intent == DIRECT_PLAYBACK_PLAYING && desired == GST_STATE_PAUSED) {
@@ -365,9 +450,16 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
                 logger_log(logger, LOGGER_ERR, "video_renderer_init: invalid playbin version %u", playbin_version);
                 g_assert(0);
             }
-            logger_log(logger, LOGGER_INFO, "Will use GStreamer playbin version %u to play HLS streamed video", playbin_version);	    
+            logger_log(logger, LOGGER_INFO, "Will use GStreamer playbin version %u to play HLS streamed video", playbin_version);
             g_assert(renderer_type[i]->pipeline);
             renderer_type[i]->codec = hls;
+            renderer_type[i]->startup_buffer_time = pi4_profile && direct_http_source ? 3 * GST_SECOND : 0;
+            if (renderer_type[i]->startup_buffer_time &&
+                g_signal_lookup("deep-element-added", GST_TYPE_BIN)) {
+                renderer_type[i]->buffering_handler = g_signal_connect(
+                    renderer_type[i]->pipeline, "deep-element-added",
+                    G_CALLBACK(configure_direct_buffering), renderer_type[i]);
+            }
             /* if we are not using an autovideosink, build a videosink based on the string "videosink" */
             if (!auto_videosink) { 
                 GstElement *playbin_videosink = make_video_sink(videosink, videosink_options);  
@@ -384,7 +476,9 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
             flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
             renderer_type[i]->diagnostics = playback_diagnostics_attach(
-                renderer_type[i]->pipeline, logger, direct_requested_at);
+                renderer_type[i]->pipeline, logger, direct_requested_at, direct_generation);
+            renderer_type[i]->gap_repair = hls_gap_repair_attach(
+                renderer_type[i]->pipeline, logger, direct_generation);
         } else {
             bool jpeg_pipeline = false;
             if (i == type_264) {
@@ -529,7 +623,10 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
 
 static void video_renderer_pause_unlocked() {
     if (hls_video || direct_request_pending) {
+        if (direct_state.failed) return;
         direct_state.intent = DIRECT_PLAYBACK_PAUSED;
+        if (renderer && renderer->direct_generation == direct_generation)
+            playback_diagnostics_control(renderer->diagnostics, &direct_state);
         direct_apply_state();
         return;
     }
@@ -542,7 +639,10 @@ static void video_renderer_pause_unlocked() {
 
 static void video_renderer_resume_unlocked() {
     if (hls_video || direct_request_pending) {
+        if (direct_state.failed) return;
         direct_state.intent = DIRECT_PLAYBACK_PLAYING;
+        if (renderer && renderer->direct_generation == direct_generation)
+            playback_diagnostics_control(renderer->diagnostics, &direct_state);
         direct_apply_state();
         return;
     }
@@ -564,13 +664,19 @@ static void video_renderer_start_unlocked() {
     GstState state;
     const gchar *state_name = NULL;
     if (hls_video) {
-        if (direct_state.intent == DIRECT_PLAYBACK_STOPPED) {
+        if (direct_state.failed || direct_state.intent == DIRECT_PLAYBACK_STOPPED) {
             return; /* A stop received during rebuilding cancels startup. */
         }
         g_object_set (G_OBJECT (renderer->pipeline), "uri", renderer->uri, NULL);
         renderer->direct_started = TRUE;
         GstStateChangeReturn initial = gst_element_set_state(renderer->pipeline, GST_STATE_PAUSED);
-        GstStateChangeReturn settled = gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        if (initial == GST_STATE_CHANGE_FAILURE) {
+            direct_fail_session(renderer);
+            return;
+        }
+        /* Preroll completes on the bus. Waiting here holds the same mutex as
+         * pause/stop/replacement, delaying every new HTTP playback request. */
+        GstStateChangeReturn settled = gst_element_get_state(renderer->pipeline, &state, NULL, 0);
         direct_state.live = initial == GST_STATE_CHANGE_NO_PREROLL || settled == GST_STATE_CHANGE_NO_PREROLL;
         /* Asynchronous preroll is handled in bus order by ASYNC_DONE. */
         direct_state.preroll_complete = initial == GST_STATE_CHANGE_SUCCESS;
@@ -731,8 +837,10 @@ static void video_renderer_hls_ready_unlocked() {
     GstStateChangeReturn ret;
     if (hls_video || direct_request_pending) {
         direct_state.intent = DIRECT_PLAYBACK_STOPPED;
+        if (direct_state.failed) return;
     }
     if (renderer && hls_video && renderer->direct_generation == direct_generation) {
+        playback_diagnostics_control(renderer->diagnostics, &direct_state);
         renderer->direct_started = FALSE;
         logger_log(logger, LOGGER_DEBUG,"video_renderer_hls_ready");
         ret = gst_element_set_state (renderer->pipeline, GST_STATE_READY);
@@ -811,6 +919,12 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
             gst_object_unref (renderer->textsrc);
             renderer->textsrc = NULL;
         }	
+        if (renderer->buffering_handler) {
+            g_signal_handler_disconnect(renderer->pipeline, renderer->buffering_handler);
+            renderer->buffering_handler = 0;
+        }
+        hls_gap_repair_free(renderer->gap_repair);
+        renderer->gap_repair = NULL;
         playback_diagnostics_free(renderer->diagnostics);
         renderer->diagnostics = NULL;
         gst_object_unref(renderer->bus);
@@ -916,7 +1030,12 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
     if (hls_video && renderer->direct_generation != direct_generation) {
         return TRUE; /* A new /play request superseded this pipeline. */
     }
+    if (hls_video && direct_state.failed) return TRUE;
     playback_diagnostics_message(renderer->diagnostics, message);
+    if (hls_video && GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+        direct_fail_session(renderer);
+        return TRUE;
+    }
 
     gint64 pos = -1;
     if (hls_video) {
@@ -987,7 +1106,10 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
         gboolean flushing = FALSE;
         gboolean closed_window = FALSE;
         gst_message_parse_error (message, &err, &debug);
-        logger_log(logger, LOGGER_INFO, "GStreamer error (video): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
+        /* Direct-playback diagnostics already report safe factory/domain/code
+         * details. GStreamer's raw error text may contain a signed media URI. */
+        if (!hls_video)
+            logger_log(logger, LOGGER_INFO, "GStreamer error (video): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
         if (strstr(err->message, "Output window was closed")) {
             closed_window = TRUE;
         }
@@ -1187,6 +1309,14 @@ static bool video_get_playback_info_unlocked(double *duration, double *position,
     if (!renderer) {
         return true;
     }
+    /* Do not report an old pipeline's state while its replacement is pending.
+     * Keep a failed session's control connection available for the next /play:
+     * returning false invokes broader HTTP playlist/connection teardown. */
+    if (hls_video && renderer->direct_generation != direct_generation) return true;
+    if (hls_video && direct_state.failed) {
+        *position = 0.0;
+        return true;
+    }
 
     if (hls_seek_enabled && hls_seek_start >= 0 && hls_seek_end >= hls_seek_start) {
         *seek_start = ((double) hls_seek_start) / GST_SECOND;
@@ -1229,13 +1359,16 @@ static void video_renderer_set_start_unlocked(float position) {
     direct_request_pending = TRUE;
     direct_generation++;
     direct_requested_at = g_get_monotonic_time();
+    if (logger) logger_log(logger, LOGGER_INFO,
+        "Direct playback: session=%" G_GUINT64_FORMAT " stage=play-request start_seconds=%.3f previous_session=%" G_GUINT64_FORMAT,
+        direct_generation, position, renderer ? renderer->direct_generation : 0);
     logger_log(logger, LOGGER_DEBUG, "register HLS video start position %f %lld", position,
                hls_requested_start_position);    
 }
 
 static void video_renderer_seek_unlocked(float position) {
     int64_t converted;
-    if (!renderer || !hls_video || renderer->direct_generation != direct_generation ||
+    if (!renderer || !hls_video || direct_state.failed || renderer->direct_generation != direct_generation ||
         !direct_playback_seconds_to_ns(position, &converted)) {
         return;
     }
@@ -1280,6 +1413,10 @@ unsigned int video_renderer_listen(void *loop, int id) {
 }
 
 static bool video_renderer_eos_watch_unlocked() {
+    if (hls_video && renderer && renderer->direct_generation == direct_generation) {
+        direct_apply_state();
+        playback_diagnostics_tick(renderer->diagnostics, &direct_state);
+    }
     if (hls_video && renderer && renderer->direct_generation == direct_generation && renderer->eos) {
         renderer->eos = FALSE;
 	return true;
@@ -1326,7 +1463,12 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
 }
 
 void video_renderer_set_start(float position) {
+    video_renderer_set_start_with_source(position, false);
+}
+
+void video_renderer_set_start_with_source(float position, bool direct_http) {
     g_rec_mutex_lock(&direct_mutex);
+    direct_http_source = direct_http;
     video_renderer_set_start_unlocked(position);
     g_rec_mutex_unlock(&direct_mutex);
 }
@@ -1339,9 +1481,22 @@ void video_renderer_seek(float position) {
 
 bool video_get_playback_info(double *duration, double *position, double *seek_start,
                              double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full) {
+    return video_get_playback_info_with_readiness(duration, position, seek_start, seek_duration,
+                                                  rate, buffer_empty, buffer_full, NULL, NULL);
+}
+
+bool video_get_playback_info_with_readiness(double *duration, double *position, double *seek_start,
+    double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full,
+    bool *ready_to_play, bool *likely_to_keep_up) {
     g_rec_mutex_lock(&direct_mutex);
     bool result = video_get_playback_info_unlocked(duration, position, seek_start, seek_duration,
                                                   rate, buffer_empty, buffer_full);
+    /* Preserve the previous readiness policy for healthy sessions, while a
+     * terminal failure or pending replacement cannot claim to be playable. */
+    bool ready = renderer && (!hls_video ||
+        (!direct_state.failed && renderer->direct_generation == direct_generation));
+    if (ready_to_play) *ready_to_play = ready;
+    if (likely_to_keep_up) *likely_to_keep_up = ready;
     g_rec_mutex_unlock(&direct_mutex);
     return result;
 }

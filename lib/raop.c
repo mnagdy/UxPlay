@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #include "raop.h"
 #include "raop_rtp.h"
@@ -310,6 +311,10 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 if (raop_rtp) {
                     logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping RAOP audio"
                                " service on RAOP connection %p", raop_conn);
+                    logger_log(raop->logger, LOGGER_INFO,
+                               "RAOP RTP audio trace rtp_generation=%" PRIu64
+                               " event=stop-request reason=new-airplay-connection",
+                               raop_rtp_get_trace_generation(raop_rtp));
                     raop_rtp_stop(raop_rtp);
                 }
 
@@ -556,6 +561,10 @@ conn_destroy(void *ptr) {
 
     if (conn->raop_rtp) {
         /* This is done in case TEARDOWN was not called */
+        logger_log(raop->logger, LOGGER_INFO,
+                   "RAOP RTP audio trace rtp_generation=%" PRIu64
+                   " event=stop-request reason=connection-destroy",
+                   raop_rtp_get_trace_generation(conn->raop_rtp));
         raop_rtp_destroy(conn->raop_rtp);
     }
     if (conn->raop_rtp_mirror) {

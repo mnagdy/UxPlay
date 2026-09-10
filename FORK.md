@@ -1,8 +1,16 @@
 # Raspberry Pi UHF compatibility branch
 
-This branch starts from upstream UxPlay **v1.73.7** and backports the existing direct HTTP/HTTPS video playback implementation. It is a small compatibility branch, not an official UxPlay release.
+This branch starts from upstream UxPlay **v1.73.7** and backports the existing direct HTTP/HTTPS video playback implementation. It is a compatibility branch, not an official UxPlay release.
 
 The original upstream README and licenses are retained. General upstream documentation is in [README.md](README.md).
+
+## Current status — 10 September 2026
+
+The user confirmed working YouTube playback after a silent UHF video stream on release `20260910T132850290330Z-52c2997e3800-dirty`. The sampled UHF HEVC video reached the display sink 1.341 seconds after the receiver's play request. UHF explicitly stopped its separate audio transport before requesting video, then supplied three complete video fragments without real audio samples. **UHF sound remains unresolved.** Receiver startup measurements exclude time spent on the phone before its request, and this does not establish compatibility with every application or 4K stream.
+
+This source includes missing-audio timeline repair, the Pi4 software-HEVC recovery workaround, faster direct-HLS buffering, terminal failed-stream cleanup, case-insensitive headers and bounded audio diagnostics. It also includes subsequently tested request-line fragmentation and FairPlay bounds fixes that have not yet been activated on the Pi. The working legacy HTTP capability profile is retained.
+
+All eleven native test groups passed for the current playback and protocol code. The two latest protocol groups also passed with UndefinedBehaviorSanitizer. Real HTTP fixtures cover normal audio/video, absent audio, delayed responses, and successful replacement after an actual stream error. A separately built [GStreamer key-validation patch](patches/README.md) passed six encrypted-stream cases and three playback/switching comparisons; the ordinary receiver build does not install that dependency patch. Historical measurements and earlier validation stages follow below.
 
 ## Provenance
 
@@ -19,7 +27,7 @@ See [the Raspberry Pi guide](docs/raspberry-pi-uhf.md). The reproducible startin
 
 For local iteration, see [developing on the Mac and deploying to the Pi](docs/development-on-pi.md). The development helper keeps incremental builds and separate releases on the Pi, with a dedicated service override and rollback. Playback optimisation proposals are in [the Pi performance plan](docs/raspberry-pi-performance.md).
 
-## Evidence and remaining work
+## Initial evidence and investigation scope
 
 The equivalent backport was built on a Raspberry Pi 4 running Raspberry Pi OS Lite. Its user reported successful UHF live TV and series playback. This is a limited device report, not an exhaustive compatibility test.
 
@@ -71,7 +79,7 @@ Validation of the Pi 4 profile: all six C/HTTP/GStreamer groups passed on Debian
 
 After reboot, the receiver started automatically with no service restarts. Its AirPlay and audio advertisements were visible from the Mac, and the advertised TCP port accepted a connection. The user then confirmed AirPlay was working and reported that YouTube playback and switching videos worked very well. This confirms the tested device workflow; extended playback, phone handover and 4K performance still need separate testing.
 
-The source and test files in this commit match the archived source for the running release `20260909T101349217073Z-cd33afca3ada-dirty`; subsequent changes only update documentation. The deployed executable has SHA-256 `0b2e79b31ead385e07eef59e2012117042d5a104870d99e393bd0a9ea46ab8a2`. The release's original source fingerprint is `907c7d7bde908bd5a6bc9bb682777b4a4b9744b0dd8bd1bba371de4d3d7a9621`.
+The historical baseline commit `52c2997e380084a44a0bea95846bbbd5e444013d` preserved the source and tests archived for release `20260909T101349217073Z-cd33afca3ada-dirty`, with documentation updates. That release's executable has SHA-256 `0b2e79b31ead385e07eef59e2012117042d5a104870d99e393bd0a9ea46ab8a2`. Its original source fingerprint is `907c7d7bde908bd5a6bc9bb682777b4a4b9744b0dd8bd1bba371de4d3d7a9621`; later source changes are described separately.
 
 Working receiver configuration:
 
@@ -89,3 +97,29 @@ hls-pi4
 ```
 
 Before committing, all 19 deployment-helper tests and all five headless test groups available on the Pi passed again. The optional FFmpeg-dependent HTTP HLS fixture is not installed on the Pi; its earlier container validation is recorded above.
+
+## UHF loading diagnostics
+
+The 10 September user comparison confirmed ALAC audio-only playback, silent UHF video, and successful YouTube picture/sound afterward. The latest startup build reached the UHF video sink 2.025 seconds after the request; four completed fragments contained no audio samples. Audio RTP had stopped before video negotiation. Follow-up changes record explicit teardown reasons and distinguish compressed audio, decoded audio and audio-sink arrival. An experiment sharing the RAOP/discovery feature mask with `/server-info` caused iOS to request an unsupported HTTP `/fp-setup` handshake, preventing playback. It was reverted: the legacy HTTP profile remains necessary until that additional protocol path is implemented and validated. UHF's missing audio is unresolved.
+
+The 9 September UHF investigation found multiple requests stuck at 0% buffering before any video decoded. INFO logging now correlates each request, control and pipeline stage with a session number; records exposed HTTP status/headers and terminal HTTP error codes; summarises the initial HLS manifest without printing its URLs; and counts media delivered to the HLS parser. Buffering decreases are visible, and an existing renderer timer reports state, data idle times and adaptive audio/video buffer levels during prolonged loading. Output and observers are bounded per session. See [the diagnostics guide](docs/development-on-pi.md#uhf-stream-loading-diagnostics) for coverage and limitations.
+
+All seven C/HTTP/GStreamer test groups passed in the ARM64 Linux container with AddressSanitizer/UndefinedBehaviorSanitizer (integrated leak detection disabled). All six groups available on the Pi passed, including a real HTTP 404 and delayed response body. The optional container HLS fixture also verified the numeric summary and playback of a direct media playlist. The logging build was activated on 9 September at 12:25 BST and captured a UHF stream with growing video buffers but no buffered audio. A sampled fragment declared AAC audio but contained only video samples. A local headless comparison reproduced the 0% stall with the empty audio track declared and completed buffering with that declaration removed; missing sound in UHF's AirPlay output remains unresolved. These changes add diagnostic information, not a claimed UHF playback fix.
+
+## Receiver recovery candidate, 9 September 2026
+
+The next candidate repairs confirmed empty audio intervals in fragmented-MP4 HLS while retaining the audio track for later sound. Pi tests now play the captured failing HEVC fragment with its original audio declaration retained, and generated live-stream tests preserve normal, late and interrupted audio. Missing-audio and stalled-HTTP channel replacements produce new video and audio; measured replacement calls took 15 ms and 104 ms in the isolated tests. See [the implementation and test limits](docs/development-on-pi.md#missing-audio-and-channel-replacement).
+
+The Pi profile selects `vc4` for `kmssink` unless a device was explicitly configured. Isolated sink initialization measured 155 ms versus 3.6–4.0 seconds with generic discovery. Hardware HEVC also passed through the existing receiver's actual `kmssink` output; a generic headless sink had given a misleading negotiation failure. That short playback proof did not cover the later observed kernel shutdown hang. Under `hls-pi4`, automatic selection now excludes only `v4l2slh265dec`, preserving H.264 hardware decoding and using software HEVC where available.
+
+Empty HTTP control replies now have explicit lengths, fixing a reproduced standard-client timeout. Audio renderer teardown is serialized against arriving packets and ignores queued errors from stopped/replaced renderers; the original queued-error-after-stop path crashed in the regression test. This candidate still requires activation and another phone-to-projector comparison. It does not establish perfect compatibility across applications or restore sound absent from the sender's HLS output.
+
+## UHF stop recovery, 9 September 2026
+
+The recovery build activated at 13:21 BST retained working YouTube playback: the first actual display buffer arrived in 791 ms, and the user confirmed good playback. UHF then reached the missing-audio repair after 10.197 seconds but produced no decoded frame before the stop. Stopping it left the receiver in the Pi kernel's `hevc_d_h265_stop` IRQ wait, preventing later YouTube playback. The first kernel blocked-task report predates the separate cancellation probe, whose later close was blocked on the receiver's driver mutex. Service liveness alone did not detect this failure.
+
+The Pi profile now excludes the exact stateless HEVC factory from automatic decoder selection before pipelines start. The change is local to this receiver process; other decoder ranks, including H.264 hardware, are preserved. Software HEVC throughput and phone-to-projector audio remain to verify after the kernel is cleared by reboot. An earlier successful 15-second HEVC hardware fixture was insufficient to establish stop/reconnect safety. The installed driver has an unbounded IRQ wait during shutdown; an [upstream Pi4 report](https://github.com/raspberrypi/linux/issues/7537) describes the same class of unkillable decoder hang.
+
+A separate startup correction accepts initialization metadata followed by the first MP4 segment boundary in one buffer. It keeps later boundaries conservative and avoids waiting for a third segment when two are already published. Regression coverage measures the first real rendered video buffer rather than treating a PLAYING state alone as success.
+
+The following candidate adds audited GStreamer 1.26.2 fragment-completion repair, reducing the single-initial-fragment regression from 10.464 s to 0.383 s while preserving delayed AAC within the same response. The Pi4 direct-HTTP route also uses a three-second buffering target; cached YouTube retains its previous settings. Additional numeric RAOP network/delivery/renderer traces target the remaining missing-sound issue without changing audio ownership. These changes still require integrated and real-device validation.

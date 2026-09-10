@@ -4,6 +4,7 @@
 
 #include <gst/gst.h>
 #include "../lib/logger.h"
+#include "direct_playback_state.h"
 
 G_BEGIN_DECLS
 
@@ -15,11 +16,19 @@ typedef struct playback_diagnostics_s playback_diagnostics_t;
  */
 playback_diagnostics_t *playback_diagnostics_attach(GstElement *playbin,
                                                    logger_t *logger,
-                                                   gint64 requested_at_us);
+                                                   gint64 requested_at_us,
+                                                   guint64 session_id);
 
 /* Relay pipeline bus messages from the renderer's existing bus callback. */
 void playback_diagnostics_message(playback_diagnostics_t *diagnostics,
                                   GstMessage *message);
+
+/* Called by the renderer's existing lifetime-serialized timer, even when no
+ * bus messages arrive. Neither method changes playback state. */
+void playback_diagnostics_tick(playback_diagnostics_t *diagnostics,
+                               const direct_playback_state_t *state);
+void playback_diagnostics_control(playback_diagnostics_t *diagnostics,
+                                  const direct_playback_state_t *state);
 
 /* Call after the pipeline has completed its transition to NULL and its bus
  * callback has stopped using diagnostics. This disconnects signals and removes

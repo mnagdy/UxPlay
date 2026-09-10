@@ -35,6 +35,7 @@ typedef struct {
     bool buffering;
     bool live;
     bool preroll_complete;
+    bool failed;
 } direct_playback_state_t;
 
 /* Called for a new play request, not when rebuilding its renderer. */
@@ -43,10 +44,21 @@ static inline void direct_playback_state_reset(direct_playback_state_t *state) {
     state->buffering = false;
     state->live = false;
     state->preroll_complete = false;
+    state->failed = false;
+}
+
+/* Failure is terminal for this request; only a new request resets it. */
+static inline void direct_playback_state_fail(direct_playback_state_t *state) {
+    state->failed = true;
+    state->intent = DIRECT_PLAYBACK_STOPPED;
+    state->buffering = false;
+    state->live = false;
+    state->preroll_complete = false;
 }
 
 static inline direct_playback_target_t
 direct_playback_state_target(const direct_playback_state_t *state) {
+    if (state->failed) return DIRECT_PLAYBACK_STOPPED;
     if (state->intent != DIRECT_PLAYBACK_PLAYING) {
         return state->intent;
     }
@@ -60,7 +72,7 @@ direct_playback_state_target(const direct_playback_state_t *state) {
 /* Buffering reports never change the user's requested playback state. */
 static inline bool
 direct_playback_state_buffer(direct_playback_state_t *state, int percent) {
-    if (percent < 0 || percent > 100) {
+    if (state->failed || percent < 0 || percent > 100) {
         return false;
     }
     state->buffering = percent < 100;

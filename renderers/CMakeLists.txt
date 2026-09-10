@@ -42,6 +42,7 @@ endif()
 pkg_check_modules(GST REQUIRED    gstreamer-1.0>=1.4 
                                   gstreamer-sdp-1.0>=1.4
                                   gstreamer-video-1.0>=1.4
+                                  gstreamer-audio-1.0>=1.4
                                   gstreamer-app-1.0>=1.4
 )
 
@@ -50,6 +51,7 @@ add_library( renderers
              audio_renderer.c
              video_renderer.c
              playback_diagnostics.c
+             hls_gap_repair.c
              mux_renderer.c )
 
 target_link_libraries ( renderers PUBLIC airplay )
@@ -89,5 +91,3 @@ elseif( CMAKE_VERSION VERSION_LESS "3.12" )
 else()		  
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
 endif()
-
-

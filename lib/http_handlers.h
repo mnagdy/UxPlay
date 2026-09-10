@@ -53,19 +53,13 @@ http_handler_server_info(raop_conn_t *conn, http_request_t *request, http_respon
 
     plist_t r_node = plist_new_dict();
 
-    /* first 12 AirPlay features bits (R to L): 0x27F = 0010 0111 1111
-     * Only bits 0-6 and bit 9  are set:
-     * 0. video supported
-     * 1. photo supported
-     * 2. video protected wirh FairPlay DRM
-     * 3. volume control supported for video
-     * 4. HLS supported
-     * 5. slideshow supported
-     * 6. (unknown)
-     * 9. audio supported.
-     */
-    plist_t features_node = plist_new_uint(0x27F); 
+    /* Keep the legacy HTTP profile: the full RAOP mask made a live client
+     * select an unsupported HTTP /fp-setup handshake instead of /play. */
+    uint64_t features = UINT64_C(0x27F);
+    plist_t features_node = plist_new_uint(features);
     plist_dict_set_item(r_node, "features", features_node);
+    logger_log(raop->logger, LOGGER_INFO,
+               "AirPlay capabilities: endpoint=server-info profile=legacy-http features=0x%" PRIx64, features);
 
     plist_t mac_address_node = plist_new_string(hw_addr);
     plist_dict_set_item(r_node, "macAddress", mac_address_node);
@@ -297,8 +291,12 @@ http_handler_fpsetup2(raop_conn_t *conn, http_request_t *request, http_response_
     http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
     int req_datalen = 0;
     const unsigned char *req_data = (unsigned char *) http_request_get_data(request, &req_datalen);
-    logger_log(raop->logger, LOGGER_ERR, "only FairPlay version 0x03 is implemented, version is 0x%2.2x",
-               req_data[4]);
+    if (req_data && req_datalen >= 5) {
+        logger_log(raop->logger, LOGGER_ERR, "only FairPlay version 0x03 is implemented, version is 0x%2.2x",
+                   req_data[4]);
+    } else {
+        logger_log(raop->logger, LOGGER_ERR, "Invalid fp-setup2 data length: %d", req_datalen);
+    }
     http_response_init(response, "HTTP/1.1", 421, "Misdirected Request");
 }
 
@@ -774,7 +772,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                        get_num_media_uri(airplay_video));
             raop->callbacks.on_video_play(raop->callbacks.cls,
                                                 get_playback_location(airplay_video),
-                                                get_start_position_seconds(airplay_video));
+                                                get_start_position_seconds(airplay_video), false);
         }
 
 
@@ -838,6 +836,16 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
 
     plist_from_bin(request_data, request_datalen, &req_root_node);
 
+    /* Keep the incoming-request timestamp separate from renderer startup.
+     * Sender names, request bodies and locations are untrusted/private. */
+    char *diagnostic_sender = NULL;
+    plist_t diagnostic_sender_node = plist_dict_get_item(req_root_node, "clientProcName");
+    if (PLIST_IS_STRING(diagnostic_sender_node)) plist_get_string_val(diagnostic_sender_node, &diagnostic_sender);
+    logger_log(raop->logger, LOGGER_INFO, "AirPlay video request: sender=%s",
+        diagnostic_sender && !strcmp(diagnostic_sender, "UHF") ? "UHF" :
+        diagnostic_sender && !strcmp(diagnostic_sender, "YouTube") ? "YouTube" : "other");
+    plist_mem_free(diagnostic_sender);
+
     plist_t req_uuid_node = plist_dict_get_item(req_root_node, "uuid");
     if (!req_uuid_node) {
        goto play_error;
@@ -879,7 +887,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
 	//printf("========= %f ============call on_video_play===== %f ==========\n", start_pos, resume_pos);
         raop->callbacks.on_video_play(raop->callbacks.cls,
                                       get_playback_location(airplay_video),
-                                      resume_pos > start_pos ? resume_pos : start_pos);
+                                      resume_pos > start_pos ? resume_pos : start_pos, false);
         return;
     }
     
@@ -962,11 +970,13 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     /* we now also support playing video from direct Content-Location sources  (such as Safari on iOS/macOS via airplay button)) */ 
     if (!strncmp(playback_location, "http://", strlen("http://")) ||
         !strncmp(playback_location, "https://", strlen("https://"))) {
+        logger_log(raop->logger, LOGGER_INFO, "AirPlay video request: route=direct-http");
         set_playback_location(airplay_video, playback_location, strlen(playback_location));
         raop->callbacks.on_video_play(raop->callbacks.cls,
                                       get_playback_location(airplay_video),
-                                      start_position_seconds);
+                                      start_position_seconds, true);
     } else if (uri_suffix) {
+        logger_log(raop->logger, LOGGER_INFO, "AirPlay video request: route=playlist-cache");
         plist_t req_client_proc_name_node = plist_dict_get_item(req_root_node, "clientProcName");
         if (req_client_proc_name_node) {
             plist_get_string_val(req_client_proc_name_node, &client_proc_name);
@@ -999,7 +1009,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         set_next_media_uri_id(airplay_video, 0);
         fcup_request((void *) conn, playback_location, apple_session_id, get_next_FCUP_RequestID(airplay_video));
     } else {
-        logger_log(raop->logger, LOGGER_ERR, "Content-Location has unsupported form:\n%s\n", playback_location);
+        logger_log(raop->logger, LOGGER_ERR, "Content-Location has unsupported form");
         goto play_error;
     }
 

@@ -919,7 +919,9 @@ static void print_info (char *name) {
     printf("-hls [v]  Support HTTP Live Streaming (HLS), Youtube app video only: \n");
     printf("          v = 2 or 3 (default 3) optionally selects video player version\n");
     printf("-hls-pi4  Enable HLS; limit cached YouTube video to H.264/AAC-LC,\n");
-    printf("          up to 1920x1080 at 60 fps (direct HTTP streams unchanged)\n");
+    printf("          up to 1920x1080 at 60 fps; select vc4 for kmssink unless\n");
+    printf("          a device is specified; use software HEVC to avoid Pi driver\n");
+    printf("          shutdown hangs (H.264 hardware decoding remains available)\n");
     printf("-lang xx  HLS language preferences (\"fr:es:..\", overrides $LANGUAGE)\n");
     printf("-lang     (or -lang 0): play undubbed HLS version (overrides $LANGUAGE)\n");
     printf("-scrsv n  Screensaver override n: 0=off 1=on while displaying video 2=always on\n");
@@ -2445,7 +2447,8 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
-    LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
+    LOGI("RAOP audio: stage=setup ct=%d spf=%d usingScreen=%d isMedia=%d audioFormat=0x%lx",
+         *ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
     switch (*ct) {
     case 2:
         type = 0x20;
@@ -2594,9 +2597,9 @@ extern "C" bool check_register(void *cls, const char *client_pk) {
 }
 /* control  callbacks for video player (unimplemented) */
 
-extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
+extern "C" void on_video_play(void *cls, const char* location, const float start_position, bool direct_http) {
     /* Register this request before rebuilding the renderer. */
-    video_renderer_set_start(start_position);
+    video_renderer_set_start_with_source(start_position, direct_http);
     url.erase();
     url.append(location);
     relaunch_video = true;
@@ -2640,13 +2643,13 @@ extern "C" float on_video_playlist_remove (void *cls) {
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
     int buffering_level;
-    bool still_playing = video_get_playback_info(&playback_info->duration, &playback_info->position,
+    bool still_playing = video_get_playback_info_with_readiness(&playback_info->duration, &playback_info->position,
                                                  &playback_info->seek_start, &playback_info->seek_duration,
                                                  &playback_info->rate,
                                                  &playback_info->playback_buffer_empty,
-                                                 &playback_info->playback_buffer_full);
-    playback_info->ready_to_play = true; //?
-    playback_info->playback_likely_to_keep_up = true; //?
+                                                 &playback_info->playback_buffer_full,
+                                                 &playback_info->ready_to_play,
+                                                 &playback_info->playback_likely_to_keep_up);
     
 #ifdef DBUS
     /*  this seems to be  called every second for first 900 secs (15 mins?) of HLS video, and subsequently
@@ -3061,6 +3064,22 @@ int main (int argc, char *argv[]) {
         display[3] = 1; /* set fps to 1 frame per sec when no video will be shown */
     }
 
+    if (hls_pi4 && videosink == "kmssink") {
+        /* Pi's display driver is known. Generic KMS discovery tries unrelated
+         * drivers first and costs several seconds on every new video sink.
+         * Keep explicit device selection, and put this property before any
+         * optional pipeline extension consumed by the mirroring renderer. */
+        size_t options_end = videosink_options.find('!');
+        std::string sink_options = videosink_options.substr(0, options_end);
+        if (sink_options.find("driver-name=") == std::string::npos &&
+            sink_options.find("bus-id=") == std::string::npos &&
+            sink_options.find("fd=") == std::string::npos) {
+            videosink_options.insert(options_end == std::string::npos ? videosink_options.size() : options_end,
+                                     " driver-name=vc4 ");
+            LOGI("Pi 4 profile: using vc4 display driver to avoid repeated KMS discovery");
+        }
+    }
+
     if (fullscreen && use_video) {
         if (videosink == "waylandsink" || videosink == "vaapisink") {
             videosink_options.append(" fullscreen=true");
@@ -3157,6 +3176,10 @@ int main (int argc, char *argv[]) {
     render_logger = logger_init();
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
+
+    if (hls_pi4) {
+        video_renderer_configure_pi4(render_logger);
+    }
 
     if (use_audio) {
         audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str());
@@ -3260,6 +3283,7 @@ int main (int argc, char *argv[]) {
             raop_stop_httpd(raop);
         }
         if (use_audio) {
+            LOGI("RAOP audio: stage=stop-request reason=video-relaunch direct_video=%d", !url.empty());
             audio_renderer_stop();
         }
         if (use_video && (close_window || preserve_connections || full_video_reset)) {

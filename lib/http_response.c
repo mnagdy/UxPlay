@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <ctype.h>
 
 #include "http_response.h"
 #include "compat.h"
@@ -23,6 +24,10 @@
 struct http_response_s {
     int complete;
     int disconnect;
+    int empty_body_length;
+    int length_forbidden;
+    int has_content_length;
+    int has_content_type;
 
     char *data;
     int buffer_size;
@@ -73,6 +78,11 @@ http_response_init(http_response_t *response, const char *protocol, int code, co
 {
     assert(response);
     response->data_length = 0;    /* can be used to reinitialize a previously-initialized response */
+    response->complete = response->disconnect = 0;
+    response->has_content_length = response->has_content_type = 0;
+    int http = !strncmp(protocol, "HTTP/", 5);
+    response->length_forbidden = http && (code < 200 || code == 204 || code == 304);
+    response->empty_body_length = http && !response->length_forbidden;
     char codestr[4] = {0};
 
     assert(code >= 100 && code < 1000);
@@ -94,6 +104,9 @@ void
 http_response_reverse_request_init(http_response_t *request, const char *method, const char *url, const char *protocol)
 {
     assert(request);
+    request->complete = request->disconnect = 0;
+    request->has_content_length = request->has_content_type = 0;
+    request->empty_body_length = request->length_forbidden = 0;
     request->data_length = 0;  /* reinitialize a previously-initialized response as a reverse-HTTP (PTTH/1.0) request */
 
     /* Add first line of response to the data array */
@@ -121,6 +134,15 @@ http_response_add_header(http_response_t *response, const char *name, const char
     assert(name);
     assert(value);
 
+    /* Header names are case insensitive. Do not duplicate explicit lengths. */
+    char lower[20];
+    size_t length = strlen(name);
+    if (length < sizeof(lower)) {
+        for (size_t i = 0; i <= length; i++) lower[i] = tolower((unsigned char) name[i]);
+        if (!strcmp(lower, "content-length")) response->has_content_length = 1;
+        if (!strcmp(lower, "content-type")) response->has_content_type = 1;
+    }
+
     http_response_add_data(response, name, strlen(name));
     http_response_add_data(response, ": ", 2);
     http_response_add_data(response, value, strlen(value));
@@ -141,28 +163,19 @@ http_response_finish(http_response_t *response, const char *data, int datalen)
         snprintf(hdrvalue, sizeof(hdrvalue)-1, "%d", datalen);
 
         /* Add Content-Length header first */
-        http_response_add_data(response, hdrname, strlen(hdrname));
-        http_response_add_data(response, ": ", 2);
-        http_response_add_data(response, hdrvalue, strlen(hdrvalue));
-        http_response_add_data(response, "\r\n\r\n", 4);
+        if (!response->has_content_length) http_response_add_header(response, hdrname, hdrvalue);
+        http_response_add_data(response, "\r\n", 2);
 
         /* Add data to the end of response */
         http_response_add_data(response, data, datalen);
     } else {
-        /* check for "Content-Type" header, with datalen = 0 */
-        const char *item = "Content-Type";
-        int item_len = strlen(item);
-        const char *part = response->data;
-        int end = response->data_length - item_len;
-        for (int i = 0; i < end; i++) {
-            if (memcmp (part, item, item_len) ==  0) {
-                const char *hdrname = "Content-Length: 0";
-                http_response_add_data(response, hdrname, strlen(hdrname));
-                http_response_add_data(response, "\r\n", 2);
-                break;
-            }
-            part++;
-        }
+        /* An ordinary HTTP response without a length is delimited by closing
+         * the connection. AirPlay keeps control connections open, so even an
+         * empty /play, /rate or /stop reply needs a zero length. Upgrades and
+         * statuses with no body keep their protocol-defined framing. */
+        if (!response->has_content_length && !response->length_forbidden &&
+            (response->empty_body_length || response->has_content_type))
+            http_response_add_header(response, "Content-Length", "0");
         /* Add extra end of line after headers */
         http_response_add_data(response, "\r\n", 2);
     }
