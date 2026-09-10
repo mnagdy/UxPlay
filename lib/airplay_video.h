@@ -54,6 +54,8 @@ bool airplay_video_finalize_cache(airplay_video_t *airplay_video);
 /* Opt-in Pi 4 selection: H.264 + AAC-LC, known dimensions <=1080p, <=60fps.
  * This filters cached FCUP masters; direct HTTP URLs are left unchanged. */
 bool airplay_video_finalize_cache_profile(airplay_video_t *airplay_video, bool pi4);
+bool airplay_video_prepare_cache_profile(airplay_video_t *airplay_video);
+bool airplay_video_finalize_cache_mpv(airplay_video_t *airplay_video);
 void set_language_code(airplay_video_t *airplay_video, const char *language_code, size_t len);
 const char *get_language_code(airplay_video_t *airplay_video);
 void set_language_name(airplay_video_t *airplay_video, const char *language_name, size_t len);

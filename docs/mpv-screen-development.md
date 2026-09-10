@@ -64,7 +64,7 @@ Use `mpv-drm-device`, `mpv-drm-connector` and `mpv-audio-device` only after iden
 | --- | --- |
 | `software` | Uses `hwdec=no`. This is the default mpv development baseline, including for HEVC. It makes no promise of real-time 4K performance. |
 | `pi4-safe` | Requires an explicitly qualified `mpv-h264-hwdec` setting, currently `v4l2m2m` or `v4l2m2m-copy`. Hardware decoding is restricted to H.264; HEVC remains software. The local mpv build must actually support the selected method. |
-| `pi4-hevc-experimental` | Reserved but deliberately rejected at startup until standalone hardware playback and shutdown are qualified on this Pi. |
+| `pi4-hevc-experimental` | Opt-in Pi mode following successful standalone 4K60 Main/Main 10 tests. Requires H.264 `v4l2m2m`, `gpu`/`drm`/`opengl` and `fast`. Adds stateless `drm` HEVC decoding, primary-plane video and a separate 1280×720 OSD plane. Runtime software fallback is disabled. Receiver integration and real streams must still be tested. |
 
 The existing `hls-pi4` cached-YouTube H.264/AAC-LC selection remains available. It does not transcode UHF media or turn a direct 4K H.264 stream into HEVC. See [Pi qualification](pi-mpv-qualification.md) for the separate device checks. The implementation gives us a second decoder/demuxer path to diagnose the current HEVC/4K failures; it does not certify those failures fixed.
 

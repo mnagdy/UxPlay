@@ -43,7 +43,11 @@ must be qualified on the target; unsupported paths do not force software decodin
 \fB\-mpv-decode\fR software|pi4-safe|pi4-hevc-experimental
 Default: software. pi4-safe additionally requires an explicitly qualified
 mpv-h264-hwdec method; hardware is restricted to H.264. The experimental HEVC
-policy is currently rejected until target-device qualification is complete.
+policy enables the tested Pi stateless DRM HEVC path with primary-plane video
+and a separate 1280x720 OSD overlay. It requires gpu/drm/opengl output, fast
+rendering and mpv-h264-hwdec v4l2m2m. Hardware codecs are limited to H.264 and
+HEVC; runtime software fallback is disabled in this opt-in mode. AirPlay and
+stream controls still require testing on the target device.
 .TP
 \fB\-mpv-h264-hwdec\fR v4l2m2m|v4l2m2m-copy
 Select the already qualified H.264 method for pi4-safe. Names must be supported

@@ -789,6 +789,15 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             store_master_playlist(airplay_video, new_master);
             create_media_data_store(airplay_video, uri_list, num_uri);
             free (uri_list);
+            if (raop->hls_pi4 && raop->hls_mpv) {
+                if (!airplay_video_prepare_cache_profile(airplay_video)) {
+                    plist_mem_free(fcup_response_url);
+                    goto post_action_error;
+                }
+                logger_log(raop->logger, LOGGER_INFO,
+                           "Direct playback: Pi mpv playlist preparation routes=%d retained=%d",
+                           num_uri, get_num_media_uri(airplay_video));
+            }
             num_uri =  get_num_media_uri(airplay_video);
             set_next_media_uri_id(airplay_video, 0);
         } else {
@@ -825,7 +834,10 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             if (sent < 0) goto post_action_error;
             set_next_media_uri_id(airplay_video, ++uri_num);
         } else {
-            if (!airplay_video_finalize_cache_profile(airplay_video, raop->hls_pi4)) {
+            bool finalized = raop->hls_pi4 && raop->hls_mpv ?
+                             airplay_video_finalize_cache_mpv(airplay_video) :
+                             airplay_video_finalize_cache_profile(airplay_video, raop->hls_pi4);
+            if (!finalized) {
                 logger_log(raop->logger, LOGGER_ERR,
                            "Direct playback: no playable variants in the downloaded playlist cache%s",
                            raop->hls_pi4 ? " matching the Raspberry Pi 4 H.264/AAC-LC profile" : "");

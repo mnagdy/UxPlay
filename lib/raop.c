@@ -90,6 +90,7 @@ struct raop_s {
     /* activate support for HLS live streaming */
     bool hls_support;
     bool hls_pi4;
+    bool hls_mpv;
     bool hls_scoped_cache;
     int scoped_fcup_request_id;
     uint64_t reverse_registration_order;
@@ -802,6 +803,8 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
         raop->hls_pi4 = (value > 0);
     } else if (strcmp(plist_item, "hls_scoped_cache") == 0) {
         raop->hls_scoped_cache = (value > 0);
+    } else if (strcmp(plist_item, "hls_mpv") == 0) {
+        raop->hls_mpv = (value > 0);
     } else {
         retval = -1;
     }	  

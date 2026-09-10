@@ -131,7 +131,8 @@ try:
                 event("property-change", id=-(2**63), name="duration", data=9999)
                 prop("duration", None)
                 prop("seekable", mode != "nonseekable")
-                prop("time-pos", 3.5)
+                initial = next((float(a.split("=", 1)[1]) for a in sys.argv if a.startswith("--start=")), 3.5)
+                prop("time-pos", initial)
                 prop("video-params", {"w": 1920, "h": 1080, "pixelformat": "yuv420p"})
                 prop("video-dec-params", {"w": 1920, "h": 1080, "pixelformat": "yuv420p"})
                 prop("core-idle", False)
@@ -186,6 +187,9 @@ try:
                                                 "ts-per-stream": [{"type": "video", "reader-pts": 0.0}]})
                 event("file-loaded")
                 loaded = True
+                if mode == "atomic-reject":
+                    event("log-message", prefix="vo/gpu", level="warn",
+                          text="Failed to commit atomic request: Error number 22 occurred")
                 if mode == "ignore-stop":
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     while True:

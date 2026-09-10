@@ -142,12 +142,27 @@ static void test_mpv_callbacks_and_handover() {
     g_assert_cmpint(screen_snapshot().state, !=, SCREEN_STATE_SEEKING);
     g_assert_cmpfloat(player_snapshot().position, ==, 5.0);
 
-    open_video("replacement.m3u8");
+    /* YouTube removes the old item, accepts a new request, then sends rate=1
+     * while FCUP is still fetching the replacement. The old item must stay
+     * paused; preserve the new request's final pause intent independently. */
+    on_video_playlist_remove(NULL);
+    await_player(MPV_BACKEND_PAUSED);
+    on_video_rate(NULL, 1.0f);
+    for (int i = 0; i < 10; ++i) tick_receiver();
+    g_assert_true(player_snapshot().requested_paused);
+    on_video_request(NULL, false);
+    on_video_rate(NULL, 1.0f);
+    for (int i = 0; i < 10; ++i) tick_receiver();
+    g_assert_true(player_snapshot().requested_paused);
+    on_video_rate(NULL, 0.0f);
+    on_video_play(NULL, "https://receiver-fixture.invalid/replacement.m3u8", 0, false);
     g_assert_cmpuint(screen_generation(), >, first);
     /* A queued replacement must not expose the previous player's timeline. */
     on_video_acquire_playback_info(NULL, &info);
     g_assert_cmpfloat(info.position, ==, 0.0);
     g_assert_false(info.ready_to_play);
+    await_player(MPV_BACKEND_PAUSED);
+    on_video_rate(NULL, 1.0f);
     await_player(MPV_BACKEND_PLAYING);
     g_assert_cmpuint(player_snapshot().generation, ==, screen_generation());
 

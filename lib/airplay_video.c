@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "raop.h"
 #include "airplay_video.h"
@@ -757,7 +758,7 @@ static bool media_uri_matches(const airplay_video_t *video, const char *stored,
     return path[0] == '/' && requested[0] != '/' && !strcmp(path + 1, requested);
 }
 
-static int available_media_index(const airplay_video_t *video, const char *uri) {
+static int media_reference_index(const airplay_video_t *video, const char *uri, bool cached) {
     if (!video || !video->media_data_store) return -1;
     for (int i = 0; i < video->num_uri; i++) {
         const media_item_t *entry = &video->media_data_store[i];
@@ -765,9 +766,13 @@ static int available_media_index(const airplay_video_t *video, const char *uri) 
             entry->num < 0 || entry->num >= video->num_uri) continue;
         const media_item_t *stored = &video->media_data_store[entry->num];
         if (stored->uri && !strcmp(entry->uri, stored->uri) &&
-            has_playlist_header(stored->playlist)) return entry->num;
+            (!cached || has_playlist_header(stored->playlist))) return entry->num;
     }
     return -1;
+}
+
+static int available_media_index(const airplay_video_t *video, const char *uri) {
+    return media_reference_index(video, uri, true);
 }
 
 /* HLS attribute values may be quoted and contain commas (notably CODECS).
@@ -889,7 +894,7 @@ bool airplay_video_finalize_cache(airplay_video_t *video) {
     return airplay_video_finalize_cache_profile(video, false);
 }
 
-bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
+static bool filter_cache_profile(airplay_video_t *video, bool pi4, bool single, bool cached) {
     if (!video) return false;
     if (!video->master_playlist && !video->media_data_store &&
         airplay_video_is_ready(video)) return true; /* Direct HTTP playback. */
@@ -928,7 +933,7 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
             !strncmp(lines[i].text, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
             char *uri = master_attribute(lines[i].text, "URI");
             if (uri) {
-                lines[i].media_index = available_media_index(video, uri);
+                lines[i].media_index = media_reference_index(video, uri, cached);
                 lines[i].keep = lines[i].media_index >= 0;
                 free(uri);
             } else if (strstr(lines[i].text, "URI=") ||
@@ -946,7 +951,7 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
             if (!uri) uri = master_attribute(lines[i].text, "SERVER-URI");
             size_t prefix_len = strlen(video->local_uri_prefix);
             if (uri && !strncmp(uri, video->local_uri_prefix, prefix_len) && uri[prefix_len] == '/') {
-                lines[i].media_index = available_media_index(video, uri);
+                lines[i].media_index = media_reference_index(video, uri, cached);
                 if (lines[i].media_index < 0) missing_local_reference = true;
             }
             free(uri);
@@ -961,7 +966,7 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
         int uri_line = i + 1;
         while (uri_line < count && !lines[uri_line].text[0]) uri_line++;
         if (uri_line >= count || lines[uri_line].text[0] == '#') continue;
-        int index = available_media_index(video, lines[uri_line].text);
+        int index = media_reference_index(video, lines[uri_line].text, cached);
         if (index < 0) continue;
         static const char *groups[] = { "AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS" };
         bool playable = true;
@@ -979,15 +984,44 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
         variants++;
     }
 
+    if (single && variants > 1) {
+        /* Match mpv's default hls-bitrate=max, after unavailable variants and
+         * their dependencies have been removed. Without valid bandwidths,
+         * leave selection to the player instead of guessing quality. */
+        int selected = -1;
+        unsigned highest = 0;
+        bool ranked = true;
+        for (int i = 0; i < count; i++) {
+            if (!lines[i].keep || strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
+            char *bandwidth = master_attribute(lines[i].text, "BANDWIDTH");
+            const char *cursor = bandwidth;
+            unsigned value;
+            bool valid = cursor && bounded_unsigned(&cursor, UINT_MAX, &value) && !*cursor && value > 0;
+            if (!valid) ranked = false;
+            else if (selected < 0 || value > highest) { selected = i; highest = value; }
+            free(bandwidth);
+        }
+        if (ranked && selected >= 0) {
+            for (int i = 0; i < count; i++) {
+                if (i == selected || !lines[i].keep || strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
+                lines[i].keep = false;
+                int uri_line = i + 1;
+                while (uri_line < count && !lines[uri_line].text[0]) uri_line++;
+                if (uri_line < count) lines[uri_line].keep = false;
+            }
+            variants = 1;
+        }
+    }
+
     if (pi4) {
         /* Do not expose unused HE-AAC/other audio groups from variants removed
          * above. Retain all available tracks within an actively used group. */
         for (int i = 0; i < count; i++) {
-            if (!lines[i].keep || !lines[i].type || strcmp(lines[i].type, "AUDIO")) continue;
+            if (!lines[i].keep || !lines[i].type || (!single && strcmp(lines[i].type, "AUDIO"))) continue;
             bool referenced = false;
             for (int j = 0; j < count && !referenced; j++) {
                 if (!lines[j].keep || strncmp(lines[j].text, "#EXT-X-STREAM-INF:", 18)) continue;
-                char *group = master_attribute(lines[j].text, "AUDIO");
+                char *group = master_attribute(lines[j].text, lines[i].type);
                 referenced = group && lines[i].group && !strcmp(group, lines[i].group);
                 free(group);
             }
@@ -1034,10 +1068,24 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
     free(video->media_data_store);
     video->media_data_store = compact;
     video->num_uri = retained;
-    video->next_uri = retained;
+    video->next_uri = cached ? retained : 0;
     free(video->master_playlist);
     video->master_playlist = filtered;
-    return airplay_video_is_ready(video);
+    return !cached || airplay_video_is_ready(video);
+}
+
+bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
+    return filter_cache_profile(video, pi4, false, true);
+}
+
+bool airplay_video_prepare_cache_profile(airplay_video_t *video) {
+    /* Keep every compatible candidate until the downloads establish which
+     * qualities and audio groups are actually available. */
+    return filter_cache_profile(video, true, false, false);
+}
+
+bool airplay_video_finalize_cache_mpv(airplay_video_t *video) {
+    return filter_cache_profile(video, true, true, true);
 }
 
 char * get_media_playlist(airplay_video_t *airplay_video, int *count, float *duration, const char *uri) {

@@ -84,7 +84,7 @@ struct mpv_backend_s {
     unsigned stop_step;
     bool closing, want_session, stop_requested, ipc_ready, preflight;
     unsigned handshake_pending;
-    bool pause_dirty, seek_dirty, volume_dirty, osd_dirty, initial_seek;
+    bool pause_dirty, seek_dirty, volume_dirty, osd_dirty, initial_seek, load_start_pending;
     double seek_seconds, volume;
     uint64_t seek_serial, seek_inflight, seek_started_at;
     bool seek_acked, seek_event, seek_restarted, inflight_initial_seek;
@@ -201,13 +201,18 @@ mpv_backend_t *mpv_backend_create(const mpv_backend_config_t *config,
     copy_text(error, error_size, "mpv requires spawn close-from support or close-on-exec by default");
     return NULL;
 #endif
-    if (config->decode_policy == MPV_DECODE_PI4_HEVC_EXPERIMENTAL) {
-        copy_text(error, error_size, "mpv HEVC hardware playback has not been qualified");
+    if (config->decode_policy != MPV_DECODE_SOFTWARE &&
+        config->decode_policy != MPV_DECODE_PI4_SAFE &&
+        config->decode_policy != MPV_DECODE_PI4_HEVC_EXPERIMENTAL) {
+        copy_text(error, error_size, "Invalid mpv decoding policy");
         return NULL;
     }
-    if (config->decode_policy != MPV_DECODE_SOFTWARE &&
-        config->decode_policy != MPV_DECODE_PI4_SAFE) {
-        copy_text(error, error_size, "Invalid mpv decoding policy");
+    if (config->decode_policy == MPV_DECODE_PI4_HEVC_EXPERIMENTAL &&
+        (!config->qualified_h264_hwdec || strcmp(config->qualified_h264_hwdec, "v4l2m2m") ||
+         !config->video_output || strcmp(config->video_output, "gpu") ||
+         !config->gpu_context || strcmp(config->gpu_context, "drm") ||
+         !config->gpu_api || strcmp(config->gpu_api, "opengl") || !config->fast_rendering)) {
+        copy_text(error, error_size, "mpv Pi HEVC requires gpu/drm/opengl, fast rendering and H.264 v4l2m2m");
         return NULL;
     }
     if (config->decode_policy == MPV_DECODE_PI4_SAFE &&
@@ -296,6 +301,7 @@ bool mpv_backend_open(mpv_backend_t *b, uint64_t generation,
         b->seek_seconds = start_seconds;
         b->seek_dirty = start_seconds > 0;
         b->initial_seek = start_seconds > 0;
+        b->load_start_pending = false;
         b->snapshot.seeking = b->seek_dirty;
         b->seek_serial = b->seek_dirty ? 1 : 0;
         b->seek_inflight = 0;
@@ -652,6 +658,15 @@ static bool spawn_player(mpv_backend_t *b)
     argv[argc++] = "--save-position-on-quit=no";
     argv[argc++] = "--keep-open=no";
     argv[argc++] = "--audio-display=no";
+    if (b->initial_seek && b->seek_dirty) {
+        /* Each session owns a fresh process. Supply its starting position
+         * before loadfile, so mpv can open HLS at that position instead of
+         * loading/initializing zero and immediately tearing it down to seek. */
+        struct json_object *start = json_object_new_double(b->seek_seconds);
+        snprintf(optional[n], sizeof(optional[n]), "--start=%s", json_object_to_json_string(start));
+        json_object_put(start);
+        argv[argc++] = optional[n++];
+    }
     if (b->fast_rendering) argv[argc++] = "--profile=fast";
     if (b->disable_audio) argv[argc++] = "--aid=no";
     argv[argc++] = "--input-ipc-client=fd://3";
@@ -661,6 +676,17 @@ static bool spawn_player(mpv_backend_t *b)
     argv[argc++] = "--demuxer-lavf-o=protocol_whitelist=[http,https,tcp,tls,crypto,httpproxy]";
     if (b->decode_policy == MPV_DECODE_SOFTWARE) {
         argv[argc++] = "--hwdec=no";
+    } else if (b->decode_policy == MPV_DECODE_PI4_HEVC_EXPERIMENTAL) {
+        /* Retain the selected H.264 decoder; HEVC uses the stateless DRM
+         * decoder. Primary-plane video avoids Pi SAND-to-GL conversion and
+         * the overlay plane's invalid zpos=0 assignment. OSD stays separate. */
+        argv[argc++] = "--hwdec=drm,v4l2m2m";
+        argv[argc++] = "--hwdec-codecs=h264,hevc";
+        argv[argc++] = "--hwdec-software-fallback=no";
+        argv[argc++] = "--gpu-hwdec-interop=drmprime-overlay";
+        argv[argc++] = "--drm-drmprime-video-plane=primary";
+        argv[argc++] = "--drm-draw-plane=overlay";
+        argv[argc++] = "--drm-draw-surface-size=1280x720";
     } else {
         snprintf(optional[n], sizeof(optional[n]), "--hwdec=%s", b->h264_hwdec);
         argv[argc++] = optional[n++];
@@ -720,6 +746,10 @@ static bool spawn_player(mpv_backend_t *b)
     close(child_fd);
     b->fd = parent_fd;
     b->pid = pid;
+    if (b->initial_seek && b->seek_dirty) {
+        b->initial_seek = b->seek_dirty = false;
+        b->load_start_pending = true;
+    }
     b->child_generation = b->snapshot.generation;
     b->snapshot.child_alive = true;
     b->snapshot.child_pid = (int)b->pid;
@@ -1355,8 +1385,12 @@ static void capture_log_diagnostic(mpv_backend_snapshot_t *s, struct json_object
     } else if (log_module(prefix, "vo") && (text_starts(t, "Can't open TTY for VT control:") ||
                text_starts(t, "Failed to set up VT switcher."))) {
         reason = "virtual-terminal-unavailable";
-    } else if (log_module(prefix, "vo") && text_starts(t, "Failed presenting frame!")) {
+    } else if (log_module(prefix, "vo") && (text_starts(t, "Failed presenting frame!") ||
+               text_starts(t, "Failed to commit atomic request:"))) {
         reason = "frame-present-failure";
+        /* mpv reports atomic frame rejection at warning level, while its
+         * output-drop counter may stay zero. Count it as an output error. */
+        if (warning) count_one(&s->video_output_errors);
     } else if (log_module(prefix, "vo") && (text_starts(t, "Failed to acquire DRM master:") ||
                text_starts(t, "Failed to commit ModeSetting atomic request:"))) {
         reason = "drm-display-failure";
@@ -1459,6 +1493,10 @@ static void message(mpv_backend_t *b, struct json_object *obj)
         update_state(b);
     } else if (json_string_is(event, "playback-restart")) {
         b->snapshot.playback_restarted = true;
+        if (b->load_start_pending) {
+            b->load_start_pending = false;
+            b->snapshot.seeking = b->seek_dirty || b->seek_inflight;
+        }
         if (b->seek_inflight && b->seek_event) b->seek_restarted = true;
         maybe_finish_seek(b);
         update_state(b);
@@ -1775,7 +1813,7 @@ void mpv_backend_poll(mpv_backend_t *b)
         if (!b->stop_requested && !b->stop_step && b->want_session) {
             if (!b->ipc_ready && now - b->started_at >= b->startup_ms)
                 fail_as(b, MPV_BACKEND_ERROR_STARTUP, "startup", "mpv IPC startup timed out");
-            else if (!b->preflight && b->load_at && !b->snapshot.ready && now - b->load_at >= b->load_ms)
+            else if (!b->preflight && b->load_at && (!b->snapshot.ready || b->load_start_pending) && now - b->load_at >= b->load_ms)
                 fail_as(b, MPV_BACKEND_ERROR_LOAD, "load", "mpv media loading timed out");
             else {
                 check_control_deadlines(b, now);

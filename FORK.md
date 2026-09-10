@@ -12,21 +12,29 @@ AirPlay. HDMI status/debug modes show receiver readiness, stream information,
 playback progress and bounded diagnostics. See [the mpv development guide](docs/mpv-screen-development.md)
 for configuration and validation history.
 
-On the Pi, fast rendering plus direct H.264 hardware output (`mpv-render-profile
-fast`, `mpv-h264-hwdec v4l2m2m`, `mpv-decode pi4-safe`) substantially improved
-1080p60 playback. The user confirmed smooth picture and sound for an independent
-AirPlay fixture and the original YouTube video on release
-`20260910T193744320774Z-52c2997e3800-dirty`. The sampled YouTube output-drop rate
-fell from about 45 to 8 frames/second with audio/video synchronization restored.
-Some frames still drop; this is not perfect 60 fps or long-run qualification.
+The opt-in `mpv-decode pi4-hevc-experimental` policy now uses hardware HEVC
+decoding and direct display-plane output while retaining `h264_v4l2m2m` for
+H.264. A two-minute independent 4K60 Main 10 test produced user-confirmed smooth
+picture and tone with no steady-playback output drops. Receiver smoke tests
+also passed for 4K60 HEVC and 1080p60 H.264; the user confirmed working YouTube
+and iPlayer. The connected display is 720p60, so these results establish decoding
+4K source material, not native 4K HDMI output. Problematic UHF sources and longer
+real-stream qualification remain open. See [the HEVC trial](docs/hevc-airplay-trial.md)
+and [the staged test suite](docs/hevc-4k-test-plan.md).
 
-Independent HEVC 720p25 MP4 and paced MPEG-TS tests also produced user-confirmed
-picture and sound. HEVC hardware remains disabled; the problematic UHF HEVC
-source and 4K remain unresolved. H.264 seek/stop and HEVC software playback passed
-targeted regression checks after the rendering update. The latest native backend,
-receiver integration and real HTTP test groups passed, along with the default
-GStreamer build and activation/rollback checks. Local stream captures and device
-configuration are excluded from Git.
+The current Pi release is `20260910T213612844711Z-52c2997e3800-dirty`.
+YouTube replacement keeps the old video paused, and cached HLS avoids unsupported
+playlist downloads and exposes the highest-bandwidth available compatible variant
+with its required audio. The user reports fast video switching. One initial start
+still took eight seconds; the remaining delay occurred after playlist preparation
+while opening at a nonzero position. Initial startup is not yet resolved. Evidence
+and limitations are in [the startup follow-up](docs/startup-switch-regression.md).
+
+Linux backend, receiver, cache and real HTTP playback checks passed, as did the
+default build's cache checks and native Pi compilation/activation health checks.
+The `software` and `pi4-safe` policies retain their existing behavior. Local
+stream captures, generated fixtures, reports and device configuration are excluded
+from Git.
 
 ## Earlier recovery checkpoint — 10 September 2026
 

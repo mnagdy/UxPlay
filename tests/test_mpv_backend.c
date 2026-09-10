@@ -104,7 +104,7 @@ static void test_validation(void)
     mpv_backend_config_t c = config();
     c.decode_policy = MPV_DECODE_PI4_HEVC_EXPERIMENTAL;
     assert(!mpv_backend_create(&c, error, sizeof(error)));
-    assert(strstr(error, "not been qualified"));
+    assert(strstr(error, "Pi HEVC requires"));
     c.decode_policy = MPV_DECODE_PI4_SAFE;
     assert(!mpv_backend_create(&c, error, sizeof(error)));
     c.qualified_h264_hwdec = "auto";
@@ -148,6 +148,40 @@ static void test_fast_rendering(void)
     assert(b);
     assert(mpv_backend_open(b, 1, "http://fixture/fast", 0));
     await_state(b, MPV_BACKEND_PLAYING);
+    cleanup(b);
+}
+
+static void test_pi_hevc_mode(void)
+{
+    char error[200];
+    mpv_backend_config_t c = config();
+    c.decode_policy = MPV_DECODE_PI4_HEVC_EXPERIMENTAL;
+    c.qualified_h264_hwdec = "v4l2m2m";
+    c.video_output = "gpu";
+    c.gpu_context = "drm";
+    c.gpu_api = "opengl";
+    c.fast_rendering = true;
+    setenv("UXPLAY_FAKE_MPV_MODE", "atomic-reject", 1);
+    mpv_backend_t *b = mpv_backend_create(&c, error, sizeof(error));
+    assert(b);
+    assert(mpv_backend_open(b, 1, "http://fixture/hevc", 0));
+    await_state(b, MPV_BACKEND_PLAYING);
+    assert(snapshot(b).video_output_errors == 1);
+    assert(!strcmp(snapshot(b).diagnostic_reason, "frame-present-failure"));
+    cleanup(b);
+    c.gpu_context = "x11";
+    assert(!mpv_backend_create(&c, error, sizeof(error)));
+}
+
+static void test_initial_position(void)
+{
+    mpv_backend_t *b = create("normal");
+    assert(mpv_backend_open(b, 1, "https://fixture/initial-position", 533));
+    assert(mpv_backend_pause(b, 1));
+    await_state(b, MPV_BACKEND_PAUSED);
+    uint64_t end = millis() + 1000;
+    while (snapshot(b).seeking && millis() < end) tick(b);
+    assert(!snapshot(b).seeking && snapshot(b).position == 533);
     cleanup(b);
 }
 
@@ -555,7 +589,7 @@ static void test_real(const char *url)
     c.packet_diagnostic_window_ms = 1000;
     assert(mpv_backend_preflight(&c, error, sizeof(error)));
     mpv_backend_t *b = mpv_backend_create(&c, error, sizeof(error));
-    assert(b && mpv_backend_open(b, 1, url, 0));
+    assert(b && mpv_backend_open(b, 1, url, 0.5));
     assert(mpv_backend_pause(b, 1));
     await_state(b, MPV_BACKEND_PAUSED);
     uint64_t end = millis() + 1500;
@@ -567,6 +601,9 @@ static void test_real(const char *url)
     assert(s.video_decoder[0] && s.audio_decoder[0] && s.video_codec[0]);
     assert(s.log_messages_active);
     assert(s.duration > 1 && s.seekable_known && s.seekable);
+    end = millis() + 2000;
+    while ((snapshot(b).seeking || snapshot(b).position < .45) && millis() < end) tick(b);
+    assert(!snapshot(b).seeking && snapshot(b).position >= .45);
     assert(mpv_backend_seek(b, 1, 1));
     assert(snapshot(b).seeking);
     assert(mpv_backend_set_osd(b, 1, "${path} {\\b1} literal diagnostic"));
@@ -657,6 +694,8 @@ int main(int argc, char **argv)
     test_validation();
     test_preflight();
     test_fast_rendering();
+    test_pi_hevc_mode();
+    test_initial_position();
     test_controls_and_replacement("normal");
     test_controls_and_replacement("partial");
     test_controls_and_replacement("out-of-order");
@@ -683,11 +722,24 @@ int main(int argc, char **argv)
     assert(f);
     char line[18000];
     bool raw_osd = false, utf8_osd = false, software = false, disabled_audio = false;
-    bool fast_rendering = false, default_rendering = false;
+    bool fast_rendering = false, default_rendering = false, hevc_mode = false, initial_start = false;
     while (fgets(line, sizeof(line), f)) {
         assert(!strstr(line, "overlapping_children"));
         assert(!strstr(line, "inherited_extra_descriptor"));
+        assert(!strstr(line, "\"seek\", 533"));
         if (strstr(line, "\"argv\"")) {
+            initial_start |= strstr(line, "--start=533") != NULL;
+            if (strstr(line, "--hwdec=drm,v4l2m2m")) {
+                hevc_mode = true;
+                assert(strstr(line, "--hwdec-codecs=h264,hevc"));
+                assert(strstr(line, "--hwdec-software-fallback=no"));
+                assert(strstr(line, "--gpu-hwdec-interop=drmprime-overlay"));
+                assert(strstr(line, "--drm-drmprime-video-plane=primary"));
+                assert(strstr(line, "--drm-draw-plane=overlay"));
+                assert(strstr(line, "--drm-draw-surface-size=1280x720"));
+            } else {
+                assert(!strstr(line, "--gpu-hwdec-interop="));
+            }
             assert(!strstr(line, "http://") && !strstr(line, "https://"));
             software |= strstr(line, "--hwdec=no") != NULL;
             disabled_audio |= strstr(line, "--aid=no") != NULL;
@@ -704,7 +756,7 @@ int main(int argc, char **argv)
     }
     fclose(f);
     assert(raw_osd && utf8_osd && software && disabled_audio);
-    assert(fast_rendering && default_rendering);
+    assert(fast_rendering && default_rendering && hevc_mode && initial_start);
     unlink(log_path);
     unlink(lock_path);
     close(extra_pipe[0]);

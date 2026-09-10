@@ -309,6 +309,62 @@ static void test_pi4_profile(raop_t *owner) {
     airplay_video_destroy(video);
 }
 
+static void test_mpv_cache_selection(raop_t *owner) {
+    const char *paths[] = { "/low.m3u8", "/high.m3u8", "/vp9.m3u8", "/low-audio.m3u8", "/high-audio.m3u8" };
+    const char *master =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"low\",NAME=\"LC\",URI=\"http://localhost:34759/low-audio.m3u8\"\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"high\",NAME=\"LC\",URI=\"http://localhost:34759/high-audio.m3u8\"\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=100,CODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1280x720,AUDIO=\"low\"\n"
+        "http://localhost:34759/low.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=200,CODECS=\"avc1.64002a,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=60,AUDIO=\"high\"\n"
+        "http://localhost:34759/high.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=300,CODECS=\"vp09.00.40.08,mp4a.40.2\",RESOLUTION=1920x1080\n"
+        "http://localhost:34759/vp9.m3u8\n";
+    /* A failed video OR required audio download must fall back to the lower
+     * playable variant, not leave mpv with an unusable high-quality route. */
+    for (int missing = -1; missing <= 3; missing++) {
+        airplay_video_t *video = cache_fixture(owner, master, paths, 5);
+        assert(airplay_video_prepare_cache_profile(video));
+        assert(get_num_media_uri(video) == 4);
+        assert(get_next_media_uri_id(video) == 0);
+        assert(!airplay_video_is_ready(video));
+        assert(!strstr(get_master_playlist(video), "vp9"));
+        for (int i = 0; i < 4; i++) if (i != missing) store_entry(video, i, media);
+        assert(airplay_video_finalize_cache_mpv(video));
+        assert(airplay_video_is_ready(video));
+        assert(get_num_media_uri(video) == 2);
+        const char *filtered = get_master_playlist(video);
+        bool high = missing != 1 && missing != 3;
+        assert((strstr(filtered, "/high.m3u8") != NULL) == high);
+        assert((strstr(filtered, "/high-audio.m3u8") != NULL) == high);
+        assert((strstr(filtered, "/low.m3u8") != NULL) == !high);
+        assert((strstr(filtered, "/low-audio.m3u8") != NULL) == !high);
+        int count;
+        float duration;
+        assert(get_media_playlist(video, &count, &duration, high ? paths[1] : paths[0]));
+        assert(get_media_playlist(video, &count, &duration, high ? paths[4] : paths[3]));
+        airplay_video_destroy(video);
+    }
+    /* Incomplete bandwidth metadata leaves quality choice with the player. */
+    const char *bad[] = { "", "BANDWIDTH=0,", "BANDWIDTH=oops,", "BANDWIDTH=4294967296," };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        char text[1024];
+        snprintf(text, sizeof(text),
+            "#EXTM3U\n#EXT-X-STREAM-INF:%sCODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1280x720\n"
+            "http://localhost:34759/low.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=200,CODECS=\"avc1.4d401f,mp4a.40.2\",RESOLUTION=1280x720\n"
+            "http://localhost:34759/high.m3u8\n", bad[i]);
+        airplay_video_t *video = cache_fixture(owner, text, paths, 2);
+        assert(airplay_video_prepare_cache_profile(video));
+        store_entry(video, 0, media);
+        store_entry(video, 1, media);
+        assert(airplay_video_finalize_cache_mpv(video));
+        assert(get_num_media_uri(video) == 2);
+        airplay_video_destroy(video);
+    }
+}
+
 int main(void) {
     /* The cache keeps an opaque owner pointer; these API operations never
      * access server state, so no listener or network service is required. */
@@ -322,6 +378,7 @@ int main(void) {
     test_no_playable_variants(owner);
     test_duplicate_after_failed_copy(owner);
     test_pi4_profile(owner);
+    test_mpv_cache_selection(owner);
     free(owner);
     puts("AirPlay video cache tests passed");
     return 0;

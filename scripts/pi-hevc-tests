@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""Prepare or run bounded, independent HEVC hardware trials on Raspberry Pi.
+
+Default: verify generated fixtures and print a plan, without starting playback.
+--run: temporarily stop uxplay.service, run ONE stage, restore the same service.
+Never changes the receiver configuration or accesses its private player IPC.
+"""
+import argparse
+import ctypes
+import fcntl
+import hashlib
+import http.server
+import json
+import math
+import os
+import re
+from pathlib import Path
+import select
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+PATHS = {'gpu': ('drm', 'drmprime'), 'overlay': ('drm', 'drmprime-overlay'),
+         'overlay-primary': ('drm', 'drmprime-overlay'),
+         'copy': ('drm-copy', 'auto')}
+FFMPEG_PATH = 'ffmpeg-drm'
+VARIANTS = {'mp4': 'video.mp4', 'ts': 'video.ts',
+            'hls-ts': 'hls-ts/index.m3u8', 'hls-fmp4': 'hls-fmp4/index.m3u8'}
+PROPS = ['time-pos', 'audio-pts', 'avsync', 'hwdec-current', 'video-dec-params',
+         'video-params', 'audio-params', 'current-vo', 'current-ao',
+         'frame-drop-count', 'decoder-frame-drop-count', 'display-fps',
+         'estimated-display-fps', 'core-idle', 'paused-for-cache', 'pause']
+
+
+def command(args, check=True, timeout=15):
+    return subprocess.run(args, capture_output=True, text=True, check=check, timeout=timeout)
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''): h.update(block)
+    return h.hexdigest()
+
+
+def checked_file(root, relative):
+    path = root / relative
+    if Path(relative).is_absolute() or '..' in Path(relative).parts:
+        raise ValueError('Invalid fixture path')
+    if any(p.is_symlink() for p in [path, *path.parents]):
+        raise ValueError('Symlink in fixture path')
+    path = path.resolve(strict=True)
+    if not path.is_relative_to(root.resolve()) or not path.is_file():
+        raise ValueError('Fixture outside root or not a file')
+    return path
+
+
+def fixtures(root, selected_ids=None, mp4_only=False):
+    manifest_path = checked_file(root, 'manifest.json')
+    data = json.loads(manifest_path.read_text())
+    if data['schema'] != 'uxplay-hevc-fixtures-v1': raise ValueError('Unknown manifest')
+    rows = data['fixtures']
+    if len(rows) != 8 or len({r['id'] for r in rows}) != 8:
+        raise ValueError('Expected eight distinct fixtures')
+    for row in rows:
+        if row['bits'] not in (8, 10) or row['fps'] not in (24, 25, 30, 60):
+            raise ValueError('Unsupported fixture metadata')
+        if selected_ids is not None and row['id'] not in selected_ids: continue
+        for name, info in row['files'].items():
+            if mp4_only and name != 'video.mp4': continue
+            path = checked_file(root, row['id'] + '/' + name)
+            if path.stat().st_size != info['bytes'] or sha(path) != info['sha256']:
+                raise ValueError('Fixture checksum mismatch: ' + row['id'] + '/' + name)
+        if not set(VARIANTS.values()).issubset(row['files']):
+            raise ValueError('Missing container variants')
+    return rows, sha(manifest_path)
+
+
+def telemetry():
+    result = {}
+    for name, args in [('temperature', ['vcgencmd', 'measure_temp']),
+                       ('throttled', ['vcgencmd', 'get_throttled'])]:
+        try: result[name] = command(args, False, 3).stdout.strip()[:128]
+        except (OSError, subprocess.TimeoutExpired): result[name] = 'unavailable'
+    return result
+
+
+def environment():
+    return {'boot': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'kernel': os.uname().release,
+            'mpv': command(['mpv', '--version']).stdout,
+            'ffmpeg': command(['ffmpeg', '-version']).stdout,
+            'runner_sha256': sha(Path(__file__)),
+            'hdmi': command(['kmsprint'], False).stdout,
+            'render_args': 'fast gpu drm opengl card1 HDMI-A-1 vc4hdmi0'}
+
+
+def mpv_args(path, stage, fd):
+    hwdec, interop = PATHS[path]
+    args = ['mpv', '--no-config', '--idle=yes', '--pause=yes', '--terminal=no',
+            '--load-scripts=no', '--ytdl=no', '--osc=no', '--osd-level=0',
+            '--input-default-bindings=no', '--audio-file-auto=no', '--sub-auto=no',
+            '--audio-display=no', '--keep-open=no', '--msg-level=all=warn',
+            '--hwdec=' + hwdec, '--hwdec-codecs=hevc', '--hwdec-software-fallback=no',
+            '--profile=fast', '--volume=50', f'--input-ipc-client=fd://{fd}']
+    if stage == 'benchmark':
+        args += ['--vo=null', '--ao=null', '--audio=no', '--untimed', '--framedrop=no']
+    else:
+        args += ['--vo=gpu', '--gpu-context=drm', '--gpu-api=opengl',
+                 '--gpu-hwdec-interop=' + interop,
+                 '--drm-device=/dev/dri/card1', '--drm-connector=HDMI-A-1',
+                 '--audio-device=alsa/plughw:CARD=vc4hdmi0,DEV=0', '--fullscreen=yes']
+    if stage == 'soak': args += ['--loop-file=inf']
+    if path == 'overlay-primary' and stage != 'benchmark':
+        args += ['--drm-drmprime-video-plane=primary', '--drm-draw-plane=overlay',
+                 '--drm-draw-surface-size=1280x720']
+    return args
+
+
+def ffmpeg_args(source, stage):
+    args = ['ffmpeg', '-hide_banner', '-loglevel', 'verbose', '-nostats',
+            '-progress', 'pipe:1', '-no_cvt_hw', '-hwaccel', 'drm',
+            '-hwaccel_output_format', 'drm_prime', '-c:v', 'hevc']
+    if stage != 'benchmark': args += ['-readrate', '1']
+    args += ['-i', source, '-map', '0:v:0', '-an', '-sn', '-dn',
+             '-c:v', 'wrapped_avframe', '-fps_mode', 'passthrough']
+    if stage == 'smoke': args += ['-t', '4']
+    return args + ['-f', 'vout_drm', '-show_all', '1', '/dev/null']
+
+
+def evaluate_ffmpeg(result, row, stage):
+    text = result['stderr']
+    expected = row['fps'] * 4 if stage == 'smoke' else row['frames']
+    result['expected_frames'] = expected
+    # Require hardware frames at the output, not just a request for hwaccel.
+    result['hardware_seen'] = any(re.search(r'Video: wrapped_avframe, (?:\d+ reference frames?, )?drm_prime\b', line)
+                                  for line in text.splitlines())
+    reasons = []
+    if not result['hardware_seen']: reasons.append('hardware frames not confirmed at DRM output')
+    if result.get('error'): reasons.append(result['error'])
+    if result['exit_code'] != 0 or result['shutdown_method'] != 'quit': reasons.append('unclean exit')
+    if result.get('frames') != expected or not result.get('progress_end'):
+        reasons.append('complete expected frame submission not observed')
+    for line in text.splitlines():
+        # FFmpeg's successful verbose input summary explicitly reports zero
+        # decode errors. Remove only that exact count, retaining real errors.
+        lower = re.sub(r'\b0 decode errors;', '', line.lower())
+        if any(word in lower for word in ('failed', 'error', 'invalid argument', 'not supported')):
+            reasons.append('FFmpeg diagnostic requires review: ' + line[:300]); break
+    if result.get('log_truncated'): reasons.append('diagnostic log exceeded retention limit')
+    for health in (result.get('before', {}), result.get('after', {})):
+        try:
+            if int(health.get('throttled', '').split('=')[-1], 16) & 15:
+                reasons.append('current power or thermal throttling observed'); break
+        except ValueError: pass
+    result['passed'] = not reasons
+    result['failure_reasons'] = reasons
+    result['submitted_fps_including_startup'] = result.get('frames', 0) / result['elapsed']
+    result['measurement'] = 'submitted frames including startup and DRM output; not independently counted HDMI presentations'
+    result['audio_tested'] = False
+    result['visual_confirmation'] = 'pending; FFmpeg reference has video only'
+    return result
+
+
+def ffmpeg_trial(source, row, stage, limit):
+    result = {'fixture': row['id'], 'path': FFMPEG_PATH, 'stage': stage,
+              'before': telemetry(), 'warnings': [], 'frames': 0}
+    proc = None
+    began = time.monotonic()
+    with tempfile.TemporaryFile() as progress, tempfile.TemporaryFile() as log:
+        try:
+            launch = [sys.executable, str(Path(__file__).resolve()), '--child', str(os.getpid())]
+            proc = subprocess.Popen(launch + ffmpeg_args(source, stage), stdin=subprocess.PIPE,
+                                    stdout=progress, stderr=log)
+            result['pid'] = proc.pid
+            proc.wait(timeout=limit)
+        except (Exception, KeyboardInterrupt) as exc:
+            result['error'] = type(exc).__name__ + ': ' + str(exc)[:300]
+        finally:
+            if proc:
+                def quit_ffmpeg(_):
+                    proc.stdin.write(b'q'); proc.stdin.flush()
+                result['shutdown_method'], result['exit_code'] = terminate(proc, quit_ffmpeg)
+                proc.stdin.close()
+            else:
+                result['shutdown_method'], result['exit_code'] = 'not-started', None
+            result['elapsed'] = time.monotonic() - began
+            result['after'] = telemetry()
+            result['log_truncated'] = log.tell() > 2 * 1024 * 1024
+            log.seek(0); result['stderr'] = log.read(2 * 1024 * 1024).decode('utf-8', 'replace')
+            progress.seek(0)
+            result['progress'] = progress.read(256 * 1024).decode('utf-8', 'replace')
+            for line in result['progress'].splitlines():
+                if line.startswith('frame='): result['frames'] = int(line.split('=', 1)[1])
+                if line == 'progress=end': result['progress_end'] = True
+    return evaluate_ffmpeg(result, row, stage)
+
+
+def number(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def measure(samples, fps):
+    # Exclude startup, pauses, seeks and loop boundaries. Never interpret a
+    # timeline jump as decoded frames or smooth progress.
+    elapsed = progressed = output_drops = decode_drops = 0.0
+    av = []
+    stalls = 0
+    drop_samples = 0
+    for a, b in zip(samples, samples[1:]):
+        if a['t'] < 3 or a.get('exclude') or b.get('exclude'): continue
+        x, y = a['p'], b['p']
+        if x.get('pause') or y.get('pause'): continue
+        dt = b['t'] - a['t']
+        if dt <= 0 or not all(number(v.get('time-pos')) for v in (x, y)): continue
+        dp = y['time-pos'] - x['time-pos']
+        if dp < 0 or dp > dt + 1: continue
+        elapsed += dt
+        progressed += dp
+        if dp < 0.01: stalls += 1
+        if all(number(v.get(k)) for v in (x, y) for k in ('frame-drop-count', 'decoder-frame-drop-count')):
+            drop_samples += 1
+        for key in ('frame-drop-count', 'decoder-frame-drop-count'):
+            if number(x.get(key)) and number(y.get(key)):
+                delta = max(0, y[key] - x[key])
+                if key == 'frame-drop-count': output_drops += delta
+                else: decode_drops += delta
+        if number(y.get('avsync')): av.append(abs(y['avsync']))
+    av.sort()
+    return {'measured_seconds': elapsed, 'progress_ratio': progressed / elapsed if elapsed else None,
+            'vo_drops': output_drops, 'decoder_drops': decode_drops,
+            'drop_fraction': (output_drops + decode_drops) / (fps * elapsed) if elapsed else None,
+            'av_abs_p95': av[min(len(av) - 1, math.ceil(len(av) * .95) - 1)] if av else None,
+            'stationary_intervals': stalls, 'drop_samples': drop_samples}
+
+
+def terminal_notice(warning, result):
+    # mpv 0.40 drm_common.c continues without its optional VT switcher when
+    # /dev/tty is an SSH pseudo-terminal. Keep the diagnostic, but distinguish
+    # this exact, observed case from decoder/DRM failures. Require GPU progress
+    # and the companion notice; normal audio/hardware/exit checks still apply.
+    return (warning.get('level') == 'error' and warning.get('prefix') == 'vo/gpu/drm'
+            and warning.get('text', '').strip() == 'VT_GETMODE failed: Inappropriate ioctl for device'
+            and any(w.get('prefix') == 'vo/gpu/drm' and w.get('level') == 'warn'
+                    and w.get('text', '').strip() ==
+                    'Failed to set up VT switcher. Terminal switching will be unavailable.'
+                    for w in result['warnings'])
+            and any(s['p'].get('current-vo') == 'gpu' and number(s['p'].get('time-pos'))
+                    and s['p']['time-pos'] > 2 for s in result['samples']))
+
+
+def evaluate(result, row, stage):
+    reasons = []
+    if not result['hardware_seen']: reasons.append('requested hardware decoder not observed')
+    if result.get('error'): reasons.append(result['error'])
+    if result.get('end_reason') == 'error': reasons.append('player reported media failure')
+    if result.get('exit_code') != 0 or result.get('shutdown_method') != 'quit':
+        reasons.append('player did not exit cleanly')
+    result['nonfatal_environment_messages'] = [w for w in result['warnings'] if terminal_notice(w, result)]
+    if any(w.get('level') in ('error', 'fatal') and not terminal_notice(w, result) for w in result['warnings']):
+        reasons.append('player emitted an error; inspect warnings')
+    # DRM submission failures are logged at warning severity by mpv. Its
+    # frame-drop counter can remain zero even though no frame was committed.
+    if result.get('display_commit_failures', 0) or any(
+            w.get('prefix', '').startswith('vo/') and
+            w.get('text', '').startswith('Failed to commit atomic request:')
+            for w in result['warnings']):
+        reasons.append('display driver rejected frame updates')
+    for health in [result.get('before', {}), result.get('after', {}), *result.get('health', [])]:
+        value = health.get('throttled', '')
+        try:
+            if int(value.split('=')[-1], 16) & 15:
+                reasons.append('current power or thermal throttling observed'); break
+        except ValueError: pass
+    samples = result['samples']
+    if stage == 'benchmark':
+        duration = result.get('eof_after_unpause')
+        result['decode_fps_including_startup'] = row['frames'] / duration if duration else None
+        if result.get('end_reason') != 'eof': reasons.append('full-file decode did not reach EOF')
+        if duration and duration > row['duration']: reasons.append('decode slower than real time')
+    else:
+        metrics = result['metrics'] = measure(samples, row['fps'])
+        audio = [s['p'].get('audio-pts') for s in samples if number(s['p'].get('audio-pts'))]
+        params = [s['p'].get('video-dec-params') for s in samples]
+        if not any(isinstance(v, dict) and v.get('w') == row['width'] and v.get('h') == row['height'] for v in params):
+            reasons.append('expected decoded resolution not observed')
+        if len(audio) < 2 or max(audio) - min(audio) < 1: reasons.append('audio clock did not advance')
+        if stage != 'smoke':
+            if metrics['drop_samples'] < 5: reasons.append('insufficient frame-drop telemetry')
+            if metrics['measured_seconds'] < 5: reasons.append('insufficient steady playback samples')
+            if metrics['progress_ratio'] is None or not .9 <= metrics['progress_ratio'] <= 1.1:
+                reasons.append('playback did not keep real time')
+            if metrics['drop_fraction'] is None or metrics['drop_fraction'] > .01:
+                reasons.append('more than 1 percent dropped frames')
+            if metrics['av_abs_p95'] is None or metrics['av_abs_p95'] > .08:
+                reasons.append('audio/video sync exceeds 80 ms or is unavailable')
+            if metrics['stationary_intervals'] > 2: reasons.append('repeated video clock stalls')
+        elif not any(number(s['p'].get('time-pos')) and s['p']['time-pos'] > 2 for s in samples):
+            reasons.append('smoke test did not progress')
+    if stage in ('seek-keyframes', 'seek-exact') and not result.get('seek_recovered'):
+        reasons.append('seek did not recover to target with advancing playback')
+    if stage in ('seek-keyframes', 'seek-exact') and not (result.get('pause_observed') and result.get('resume_observed')):
+        reasons.append('pause/resume not observed')
+    if stage == 'soak' and result.get('elapsed', 0) < 115:
+        reasons.append('soak ended before its required duration')
+    result['passed'] = not reasons
+    result['failure_reasons'] = reasons
+    result['visual_confirmation'] = 'pending: user must confirm smooth picture and audible tone'
+    return result
+
+
+def terminate(proc, send):
+    method = 'quit'
+    if proc.poll() is None:
+        try:
+            send(['quit'])
+            proc.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            method = 'terminate'
+            proc.terminate()
+            try: proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                method = 'kill'; proc.kill()
+                try: proc.wait(timeout=1)
+                except subprocess.TimeoutExpired: method = 'unreaped'
+    return method, proc.poll()
+
+
+def child_setup(expected_parent):
+    # Do not leave an idle player owning HDMI if the supervising process dies.
+    if ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0) != 0: os._exit(125)
+    if os.getppid() != expected_parent: os._exit(125)
+
+
+def trial(source, row, path, stage, limit):
+    parent, child = socket.socketpair()
+    result = {'fixture': row['id'], 'path': path, 'stage': stage, 'samples': [],
+              'warnings': [], 'events': [], 'health': [], 'hardware_seen': False, 'before': telemetry()}
+    proc = None
+    stderr_log = tempfile.TemporaryFile()
+    def send(cmd):
+        parent.sendall((json.dumps({'command': cmd}) + '\n').encode())
+    began = time.monotonic()
+    try:
+        # A fresh launcher avoids preexec_fn after the HTTP thread has started.
+        launch = [sys.executable, str(Path(__file__).resolve()), '--child', str(os.getpid())]
+        proc = subprocess.Popen(launch + mpv_args(path, stage, child.fileno()),
+                                pass_fds=(child.fileno(),),
+                                stdout=subprocess.DEVNULL, stderr=stderr_log)
+        result['pid'] = proc.pid
+        child.close(); parent.settimeout(1)
+        for i, prop in enumerate(PROPS): send(['observe_property', i + 1, prop])
+        send(['request_log_messages', 'warn'])
+        send(['loadfile', source, 'replace'])
+        state, buffer = {}, b''
+        sampled = shown = health_at = -1
+        unpaused = None
+        control = 0
+        seek_time = None
+        while proc.poll() is None and time.monotonic() - began < limit:
+            ready, _, _ = select.select([parent], [], [], .05)
+            if ready:
+                data = parent.recv(65536)
+                if not data: break
+                buffer += data
+                if len(buffer) > 524288: raise RuntimeError('IPC size limit')
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    obj = json.loads(line)
+                    event = obj.get('event')
+                    if event == 'property-change' and obj.get('name') in PROPS:
+                        state[obj['name']] = obj.get('data')
+                        if obj['name'] == 'hwdec-current' and obj.get('data') == PATHS[path][0]:
+                            result['hardware_seen'] = True
+                    if event == 'file-loaded' and unpaused is None:
+                        unpaused = time.monotonic()
+                        send(['set_property', 'pause', False])
+                    if event in ('file-loaded', 'playback-restart', 'end-file'):
+                        result['events'].append({'event': event, 't': time.monotonic() - began})
+                    if event == 'end-file':
+                        result['end_reason'] = obj.get('reason')
+                        result['end_error'] = obj.get('file_error')
+                        if obj.get('reason') == 'eof' and unpaused:
+                            result['eof_after_unpause'] = time.monotonic() - unpaused
+                    if event == 'log-message':
+                        if str(obj.get('prefix', '')).startswith('vo/') and str(obj.get('text', '')).startswith('Failed to commit atomic request:'):
+                            result['display_commit_failures'] = result.get('display_commit_failures', 0) + 1
+                        if len(result['warnings']) < 100:
+                            result['warnings'].append({k: str(obj.get(k, ''))[:1000] for k in ('level', 'prefix', 'text')})
+            t = time.monotonic() - began
+            age = time.monotonic() - unpaused if unpaused else 0
+            if t - health_at >= 5:
+                result['health'].append({'t': t, **telemetry()}); health_at = t
+            if stage.startswith('seek-') and unpaused:
+                if control == 1 and state.get('pause') is True: result['pause_observed'] = True
+                if control == 2 and state.get('pause') is False: result['resume_observed'] = True
+                if age > 5 and control == 0:
+                    send(['set_property', 'pause', True]); control = 1
+                    result['events'].append({'event': 'pause-request', 't': t})
+                if age > 6 and control == 1:
+                    send(['set_property', 'pause', False]); control = 2
+                if age > 8 and control == 2:
+                    send(['seek', 2, 'absolute+' + ('exact' if stage == 'seek-exact' else 'keyframes')])
+                    seek_time = t; control = 3
+                    result['events'].append({'event': 'seek-request', 'target': 2, 't': t})
+                if seek_time and 1 < t - seek_time < 5 and number(state.get('time-pos')):
+                    if 2.5 < state['time-pos'] < 7: result['seek_recovered'] = True
+            if t - sampled >= .5:
+                result['samples'].append({'t': t, 'exclude': age < 3 or (stage.startswith('seek-') and 4 < age < 11),
+                                          'p': dict(state)})
+                sampled = t
+            if stage != 'benchmark' and t - shown >= .5:
+                message = (f"HEVC test | {row['id']} | {path} | {stage}\n"
+                           f"Decoder: {state.get('hwdec-current', 'waiting')} | {row['width']}x{row['height']} {row['fps']} fps\n"
+                           f"Position: {state.get('time-pos')} | Audio: {state.get('audio-pts')} | AV: {state.get('avsync')}\n"
+                           f"VO drops: {state.get('frame-drop-count')} | Decoder drops: {state.get('decoder-frame-drop-count')}\n"
+                           "Watch movement and listen for the quiet tone")
+                send(['show-text', message, 1500]); shown = t
+            if result.get('end_reason'): break
+        result['elapsed'] = time.monotonic() - began
+    except (Exception, KeyboardInterrupt) as exc:
+        result['error'] = type(exc).__name__ + ': ' + str(exc)[:300]
+    finally:
+        if proc:
+            result['shutdown_method'], result['exit_code'] = terminate(proc, send)
+            if result['shutdown_method'] == 'unreaped':
+                try: result['process_status'] = Path(f'/proc/{proc.pid}/status').read_text()[:1000]
+                except OSError: pass
+        child.close(); parent.close()
+        stderr_log.seek(0)
+        result['startup_stderr'] = stderr_log.read(16384).decode('utf-8', 'replace')
+        stderr_log.close()
+        result['after'] = telemetry()
+    return evaluate(result, row, stage)
+
+
+def prerequisite(stage, fixture):
+    if stage == 'smoke': return None
+    if stage in ('seek-keyframes', 'http', 'soak'): return ('display', fixture['id'])
+    if stage == 'seek-exact': return ('seek-keyframes', fixture['id'])
+    return ('smoke', 'all')
+
+
+def requirements(stage, fixture):
+    if stage == 'smoke': return []
+    needed = [('smoke', 'all')]
+    if stage in ('seek-keyframes', 'seek-exact', 'http', 'soak'):
+        needed.append(('display', fixture['id']))
+    if stage == 'seek-exact': needed.append(('seek-keyframes', fixture['id']))
+    return needed
+
+
+def gate_key(stage, name, path): return f'{stage}-{name}-{path}'
+
+
+def gate_ok(gates, key, fingerprint):
+    entry = gates.get(key, {})
+    return entry.get('fingerprint') == fingerprint and entry.get('passed') is True
+
+
+def no_players():
+    return all(command(['pgrep', '-x', name], False).returncode == 1 for name in ('mpv', 'uxplay', 'ffmpeg'))
+
+
+def restore_receiver(stop_attempted):
+    if not stop_attempted or not no_players(): return False
+    command(['sudo', '-n', 'systemctl', 'start', 'uxplay.service'], False)
+    return command(['systemctl', 'is-active', 'uxplay.service'], False).stdout.strip() == 'active'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--fixtures', type=Path, required=True)
+    parser.add_argument('--results', type=Path, help='Default: sibling results directory')
+    parser.add_argument('--stage', choices=['smoke', 'benchmark', 'display', 'seek-keyframes',
+                                          'seek-exact', 'http', 'soak'], default='smoke')
+    parser.add_argument('--path', choices=[*PATHS, FFMPEG_PATH], default='gpu')
+    parser.add_argument('--fixture', default='2160p30-main')
+    parser.add_argument('--transport', choices=VARIANTS, default='mp4')
+    parser.add_argument('--run', action='store_true')
+    args = parser.parse_args()
+    if args.path == FFMPEG_PATH and args.stage not in ('smoke', 'benchmark', 'display'):
+        parser.error('FFmpeg reference supports smoke, benchmark and display only; video only')
+    root = args.fixtures.resolve(strict=True)
+    selected_ids = {'720p25-main', '720p25-main10'} if args.stage == 'smoke' else {args.fixture}
+    rows, manifest_hash = fixtures(root, selected_ids, mp4_only=args.stage != 'http')
+    selected = next((r for r in rows if r['id'] == args.fixture), None)
+    if not selected: parser.error('Unknown fixture')
+    plan = ([r for r in rows if r['height'] == 720] * 3 if args.stage == 'smoke' else [selected])
+    print(json.dumps({'stage': args.stage, 'path': args.path, 'tests': [r['id'] for r in plan],
+                      'transport': args.transport, 'fixtures_verified': len({r['id'] for r in plan}),
+                      'requires': requirements(args.stage, selected), 'will_run': args.run}, indent=2), flush=True)
+    if not args.run: return 0
+    if sys.platform != 'linux' or os.getuid() == 0:
+        parser.error('Run as the normal Pi user; sudo is used only for service control')
+    results = args.results or root.parent / 'results'
+    results.mkdir(parents=True, exist_ok=True)
+    # A fixed per-user lock prevents two suites with different result directories.
+    lock = (Path.home() / '.uxplay-hevc-tests.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    env = environment()
+    # Framebuffer IDs and service PID vary across restoration; compare mode only.
+    env_for_gate = {k: v for k, v in env.items() if k != 'hdmi'}
+    env_for_gate['modes'] = [line.strip() for line in env['hdmi'].splitlines() if line.strip().startswith(('Crtc ', 'Connector '))]
+    fingerprint = hashlib.sha256((json.dumps(env_for_gate, sort_keys=True) + manifest_hash).encode()).hexdigest()
+    gates_file = results / 'gates.json'
+    gates = json.loads(gates_file.read_text()) if gates_file.exists() else {}
+    for needed in requirements(args.stage, selected):
+        if not gate_ok(gates, gate_key(*needed, args.path), fingerprint):
+            raise RuntimeError('Run and pass prerequisite first: ' + ' '.join(needed) + ' via ' + args.path)
+    if command(['systemctl', 'is-active', 'uxplay.service'], False).stdout.strip() != 'active':
+        raise RuntimeError('Receiver must initially be active')
+    subprocess.run(['sudo', '-v'], check=True)
+    limit = 9 if args.stage == 'smoke' else 120 if args.stage == 'soak' else selected['duration'] + 20
+    timer = 'uxplay-hevc-recovery-' + uuid.uuid4().hex[:12]
+    recovery = 'if ! /usr/bin/pgrep -x mpv >/dev/null && ! /usr/bin/pgrep -x uxplay >/dev/null && ! /usr/bin/pgrep -x ffmpeg >/dev/null; then /usr/bin/systemctl start uxplay.service; fi'
+    command(['sudo', '-n', 'systemd-run', '--quiet', '--unit=' + timer,
+             '--on-active=' + str(len(plan) * (limit + 10) + 60) + 's', '/bin/sh', '-c', recovery])
+    result = {'environment': env, 'manifest_sha256': manifest_hash, 'trials': [],
+              'receiver_restored': False, 'recovery_timer': timer}
+    out = results / (time.strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:6] + '.json')
+    stop_attempted = False
+    server = None
+    key = gate_key(args.stage, 'all' if args.stage == 'smoke' else selected['id'], args.path)
+    # Invalidate any old pass before repeating an experiment that may now fail.
+    gates.pop(key, None)
+    gates_file.write_text(json.dumps(gates, indent=2) + '\n')
+    def interrupted(*_): raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        stop_attempted = True
+        command(['sudo', '-n', 'systemctl', 'stop', 'uxplay.service'])
+        if not no_players(): raise RuntimeError('A player is still present after service stop')
+        if args.stage == 'http':
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *a, **kw): super().__init__(*a, directory=str(root), **kw)
+                def log_message(self, *_): pass
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            server.daemon_threads = True
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        for row in plan:
+            if not no_players(): raise RuntimeError('Refusing competing players')
+            relative = row['id'] + '/' + VARIANTS[args.transport if args.stage == 'http' else 'mp4']
+            source = (f'http://127.0.0.1:{server.server_port}/' + relative if server else str(root / relative))
+            print('START ' + row['id'] + ' / ' + args.path + ' / ' + args.stage, flush=True)
+            item = (ffmpeg_trial(source, row, args.stage, limit) if args.path == FFMPEG_PATH
+                    else trial(source, row, args.path, args.stage, limit))
+            result['trials'].append(item)
+            out.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n')
+            print(json.dumps({k: item[k] for k in ('passed', 'failure_reasons', 'shutdown_method')}), flush=True)
+            if not item['passed']: break
+    except (Exception, KeyboardInterrupt) as exc:
+        result['error'] = type(exc).__name__ + ': ' + str(exc)[:500]
+    finally:
+        if server: server.shutdown(); server.server_close()
+        try:
+            result['receiver_restored'] = restore_receiver(stop_attempted)
+            if result['receiver_restored']:
+                command(['sudo', '-n', 'systemctl', 'stop', timer + '.timer'], False)
+        except Exception as exc: result['restore_error'] = str(exc)[:300]
+        result['passed'] = (len(result['trials']) == len(plan) and all(r['passed'] for r in result['trials'])
+                            and result['receiver_restored'] and not result.get('error'))
+        gates[key] = {'passed': result['passed'], 'fingerprint': fingerprint, 'report': out.name}
+        gates_file.write_text(json.dumps(gates, indent=2) + '\n')
+        out.write_text(json.dumps(result, indent=2, allow_nan=False) + '\n')
+        print('Report: ' + str(out), flush=True)
+        print('Receiver restored.' if result['receiver_restored'] else
+              'Receiver NOT confirmed restored. Stop testing and inspect the report; do not start another player.', flush=True)
+    lock.close()
+    return 0 if result['passed'] else 1
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 3 and sys.argv[1] == '--child':
+        child_setup(int(sys.argv[2]))
+        os.execvp(sys.argv[3], sys.argv[3:])
+    raise SystemExit(main())

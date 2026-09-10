@@ -235,6 +235,10 @@ static mpv_backend_t *mpv_player = NULL;
 static mpv_backend_config_t mpv_config = {};
 static std::string mpv_executable, mpv_vo, mpv_context, mpv_api, mpv_drm_device;
 static std::string mpv_connector, mpv_audio_device, mpv_h264_hwdec;
+/* Protected by display_mutex: controls received while FCUP prepares a new
+ * source belong to that request, never to the previous player's generation. */
+static uint64_t mpv_pending_request = 0;
+static bool mpv_pending_paused = false, mpv_playlist_detached = false;
 static mpv_decode_policy_t mpv_policy = MPV_DECODE_SOFTWARE;
 static bool mpv_fast_rendering = false;
 #endif
@@ -3305,6 +3309,15 @@ extern "C" void on_video_request(void *cls, bool direct_http) {
     screen_status_event(generation, SCREEN_EVENT_PREPARING);
     trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=request route=%s monotonic_ms=%" G_GINT64_FORMAT,
          (guint64)generation, direct_http ? "direct-http" : "playlist-cache", (gint64)(g_get_monotonic_time()/1000));
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        mpv_pending_request = generation;
+        mpv_pending_paused = false;
+        mpv_playlist_detached = false;
+        if (mpv_owns_output) mpv_backend_pause(mpv_player, mpv_generation);
+    }
+#endif
 }
 
 extern "C" void on_video_request_error(void *cls) {
@@ -3338,6 +3351,10 @@ extern "C" void on_video_play(void *cls, const char* location, const float start
         }
         mpv_rebuild_pending = false;
         mpv_generation = generation;
+        if (mpv_pending_request == generation && mpv_pending_paused)
+            mpv_backend_pause(mpv_player, generation);
+        mpv_pending_request = 0;
+        mpv_playlist_detached = false;
         mpv_owns_output = true;
         trace_playback_record("MPV playback: session=%" G_GUINT64_FORMAT " request=queued route=%s start=%.3f",
              (guint64)generation, direct_http ? "direct-http" : "playlist-cache", start_position);
@@ -3358,6 +3375,11 @@ extern "C" void on_video_scrub(void *cls, const float position) {
     LOGI("on_video_scrub: position = %7.5f\n", position);
 #ifdef UXPLAY_HAVE_MPV
     if (mpv_player) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        if (mpv_pending_request || mpv_playlist_detached) {
+            trace_mpv_control(mpv_pending_request ? mpv_pending_request : mpv_generation.load(), "seek", false, position);
+            return;
+        }
         const uint64_t generation = mpv_generation;
         const bool accepted = mpv_backend_seek(mpv_player, generation, position);
         trace_mpv_control(generation, "seek", accepted, position);
@@ -3373,6 +3395,14 @@ extern "C" void on_video_rate(void *cls, const float rate) {
     LOGI("on_video_rate = %7.5f\n", rate);
 #ifdef UXPLAY_HAVE_MPV
     if (mpv_player) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        if (mpv_pending_request || mpv_playlist_detached) {
+            const bool accepted = mpv_pending_request && (rate == 0.0f || rate == 1.0f);
+            if (accepted) mpv_pending_paused = rate == 0.0f;
+            trace_mpv_control(mpv_pending_request ? mpv_pending_request : mpv_generation.load(),
+                              rate == 1.0f ? "resume" : "pause", accepted, rate);
+            return;
+        }
         const uint64_t generation = mpv_generation;
         const bool accepted = rate == 1.0f ? mpv_backend_resume(mpv_player, generation) :
             rate == 0.0f ? mpv_backend_pause(mpv_player, generation) : false;
@@ -3401,6 +3431,8 @@ extern "C" float on_video_playlist_remove (void *cls) {
 #ifdef UXPLAY_HAVE_MPV
     if (mpv_player) {
         mpv_backend_snapshot_t snapshot;
+        std::lock_guard<std::mutex> guard(display_mutex);
+        mpv_playlist_detached = true;
         const uint64_t generation = mpv_generation;
         const bool accepted = mpv_backend_pause(mpv_player, generation);
         trace_mpv_control(generation, "playlist-pause", accepted, 0);
@@ -3424,6 +3456,8 @@ extern "C" float on_video_playlist_remove (void *cls) {
         std::lock_guard<std::mutex> guard(display_mutex);
         const uint64_t generation = mpv_generation;
         const uint64_t request_generation = screen_generation();
+        mpv_pending_request = 0;
+        mpv_playlist_detached = true;
         screen_status_event(request_generation, SCREEN_EVENT_STOPPING);
         const bool accepted = mpv_backend_stop(mpv_player, generation);
         trace_mpv_control(generation, "stop", accepted, 0);
@@ -3588,6 +3622,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     if (pin_pw == 1) raop_set_plist(raop, "pin", (int) pin);
     if (hls_support) raop_set_plist(raop, "hls", 1);
     if (airplay_video_mpv) raop_set_plist(raop, "hls_scoped_cache", 1);
+    if (airplay_video_mpv) raop_set_plist(raop, "hls_mpv", 1);
     if (hls_pi4) {
         raop_set_plist(raop, "hls_pi4", 1);
         LOGI("Cached YouTube HLS profile: Raspberry Pi 4, H.264/AAC-LC up to 1080p60");

@@ -508,7 +508,7 @@ static void test_duplicate_uri_requires_current_request_id(void) {
     fixture_destroy(&f);
 }
 
-static void test_pi4_profile_reaches_download_finalizer(bool enabled) {
+static void test_pi4_profile_reaches_download_finalizer(bool enabled, bool mpv) {
     static const char mixed_master[] =
         "#EXTM3U\n#EXT-X-VERSION:3\n"
         "#EXT-X-STREAM-INF:BANDWIDTH=200000,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=1280x720\n"
@@ -520,15 +520,18 @@ static void test_pi4_profile_reaches_download_finalizer(bool enabled) {
     fixture_t f;
     fixture_init(&f);
     assert(raop_set_plist(&f.raop, "hls_pi4", enabled) == 0);
+    assert(raop_set_plist(&f.raop, "hls_mpv", mpv) == 0);
     play_request(&f);
     expect_request(master_url);
     assert(action_response(&f, master_url, 1, 200, mixed_master) == 200);
     expect_request(media0);
     assert(action_response(&f, media0, 2, 200, media) == 200);
-    expect_request(media1);
-    assert(action_response(&f, media1, 3, 200, media) == 200);
-    expect_request(media2);
-    assert(action_response(&f, media2, 4, 200, media) == 200);
+    if (!(enabled && mpv)) {
+        expect_request(media1);
+        assert(action_response(&f, media1, 3, 200, media) == 200);
+        expect_request(media2);
+        assert(action_response(&f, media2, 4, 200, media) == 200);
+    }
     expect_request(NULL);
     assert(f.play_calls == 1);
     airplay_video_t *video = hls_get_current_video(&f.raop);
@@ -538,6 +541,48 @@ static void test_pi4_profile_reaches_download_finalizer(bool enabled) {
     assert(strstr(filtered, "/itag/100/mediadata.m3u8"));
     assert((strstr(filtered, "vp09") != NULL) == !enabled);
     assert((strstr(filtered, "3840x2160") != NULL) == !enabled);
+    play_request(&f);
+    expect_request(NULL);
+    assert(f.play_calls == 2);
+    fixture_destroy(&f);
+}
+
+static void test_mpv_scoped_quality_selection(bool high_available) {
+    const char *master =
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=200000,CODECS=\"avc1.64001f,mp4a.40.2\",RESOLUTION=1280x720\n"
+        "mlhls://fixture.invalid/current-video/itag/100/mediadata.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=800000,CODECS=\"avc1.64002a,mp4a.40.2\",RESOLUTION=1920x1080,FRAME-RATE=60\n"
+        "mlhls://fixture.invalid/current-video/itag/200/mediadata.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"vp09.00.40.08,mp4a.40.2\",RESOLUTION=1920x1080\n"
+        "mlhls://fixture.invalid/current-video/itag/300/mediadata.m3u8\n";
+    fixture_t f;
+    fixture_init(&f);
+    f.raop.hls_pi4 = f.raop.hls_mpv = f.raop.hls_scoped_cache = true;
+    unsigned char local[4] = {127, 0, 0, 1};
+    f.conn.remote = local;
+    f.conn.remotelen = sizeof(local);
+    play_request(&f);
+    expect_request(master_url);
+    assert(action_response(&f, master_url, 1, 200, master) == 200);
+    expect_request(media0);
+    assert(action_response(&f, media0, 2, 200, media) == 200);
+    expect_request(media1);
+    assert(action_response(&f, media1, 3, high_available ? 200 : 404, high_available ? media : "missing") == 200);
+    expect_request(NULL);
+    assert(f.play_calls == 1);
+    airplay_video_t *video = hls_get_current_video(&f.raop);
+    assert(airplay_video_is_ready(video));
+    assert(get_num_media_uri(video) == 1);
+    const char *filtered = get_master_playlist(video);
+    assert((strstr(filtered, "/itag/200/") != NULL) == high_available);
+    assert((strstr(filtered, "/itag/100/") != NULL) == !high_available);
+    assert(!strstr(filtered, "/itag/300/"));
+    char path[192], reply[8192];
+    snprintf(path, sizeof(path), "/cache/%s/itag/%d/mediadata.m3u8",
+             airplay_video_get_cache_id(video), high_available ? 200 : 100);
+    assert(invoke_plain(&f, http_handler_hls, "GET", path, NULL, reply, sizeof(reply)) == 200);
+    assert(strstr(reply, "generated-segment.ts"));
     play_request(&f);
     expect_request(NULL);
     assert(f.play_calls == 2);
@@ -994,8 +1039,12 @@ int main(void) {
     test_missing_or_malformed_master_is_rejected();
     test_all_media_variants_failed_is_rejected();
     test_duplicate_uri_requires_current_request_id();
-    test_pi4_profile_reaches_download_finalizer(false);
-    test_pi4_profile_reaches_download_finalizer(true);
+    test_pi4_profile_reaches_download_finalizer(false, false);
+    test_pi4_profile_reaches_download_finalizer(true, false);
+    test_pi4_profile_reaches_download_finalizer(false, true);
+    test_pi4_profile_reaches_download_finalizer(true, true);
+    test_mpv_scoped_quality_selection(false);
+    test_mpv_scoped_quality_selection(true);
     puts("HTTP HLS cache regression tests passed.");
     return 0;
 }
