@@ -558,12 +558,10 @@ httpd_thread(void *arg)
             /* Parse HTTP request from data read from connection */
             http_request_add_data(connection->request, buffer, recv_datalen);
             if (http_request_has_error(connection->request)) {
-                char *data = utils_data_to_text((const char *) buffer, recv_datalen);
-                logger_log(httpd->logger, LOGGER_ERR, "httpd error in parsing: %s\n%s\n%s",
-                           http_request_get_error_name(connection->request),
-                           http_request_get_error_description(connection->request),
-                           data);
-                free (data);
+                /* A malformed request can contain authorization headers or
+                 * private source locations. Keep the parser code, not bytes. */
+                logger_log(httpd->logger, LOGGER_ERR, "HTTP request parse failed: code=%s received_bytes=%d",
+                           http_request_get_error_name(connection->request), recv_datalen);
                 httpd_remove_connection(httpd, connection, 0);
                 continue;
             }

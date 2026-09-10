@@ -104,6 +104,10 @@ struct raop_callbacks_s {
     void  (*export_dacp) (void *cls, const char *active_remote, const char *dacp_id);
     int   (*video_set_codec)(void *cls, video_codec_t codec);
     /* for HLS video player controls */
+    /* Optional early status callbacks. No location or sender payload is
+     * exposed. The error callback concerns only an accepted current request. */
+    void  (*on_video_request) (void *cls, bool direct_http);
+    void  (*on_video_request_error) (void *cls);
     void  (*on_video_play) (void *cls, const char *location, const float start_position, bool direct_http);
     void  (*on_video_scrub) (void *cls, const float position);
     void  (*on_video_rate) (void *cls, const float rate);
@@ -121,6 +125,9 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short port, const cha
 char *raop_get_lang(raop_t *raop);
 uint64_t get_local_time();
 void raop_handle_eos(raop_t *raop);
+/* Internal scoped-cache correlation IDs, serialized by the HTTP dispatcher.
+ * Zero means exhausted; IDs are never reused within a receiver lifetime. */
+int raop_next_scoped_fcup_request_id(raop_t *raop);
 
 RAOP_API raop_t *raop_init(raop_callbacks_t *callbacks);
 RAOP_API int raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile);

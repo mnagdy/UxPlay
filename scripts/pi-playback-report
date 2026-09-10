@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""Export a bounded, read-only Pi playback report without raw logs or media URLs.
+
+Requires an explicit --host. The collector runs over SSH stdin and creates no
+remote files. It never reads receiver config/cmdline, connects to player IPC,
+opens media devices, changes services or requests media playback.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import pwd
+import fcntl
+import stat
+from pathlib import Path
+import platform
+import re
+import selectors
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import datetime, timezone
+
+
+SCHEMA = "uxplay-playback-report-v1"
+UNIT = "uxplay.service"
+MAX_WINDOW_MINUTES = 30
+RAW_BYTE_LIMIT = 4 * 1024 * 1024
+RAW_ENTRY_LIMIT = 4096
+LINE_LIMIT = 65536
+DEFAULT_RECORD_LIMIT = 512
+DEFAULT_EXPORT_LIMIT = 512 * 1024
+HARD_RECORD_LIMIT = 2048
+HARD_EXPORT_LIMIT = 2 * 1024 * 1024
+RETAINED_FILE_LIMIT = 1024 * 1024
+RETAINED_FILES = ("playback-trace.jsonl", "playback-trace.previous.jsonl")
+UUID = re.compile(r"[0-9a-f]{32}")
+VERSION = re.compile(r"[0-9][A-Za-z0-9.+:~_-]{0,95}")
+RELEASE = re.compile(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{7,40}(?:-dirty)?")
+
+
+def enum(*values):
+    allowed = frozenset(values)
+    return lambda value: value if value in allowed else None
+
+
+def integer(value, minimum=0, maximum=(1 << 64) - 1):
+    if not re.fullmatch(r"-?[0-9]{1,20}", value):
+        return None
+    number = int(value)
+    return number if minimum <= number <= maximum else None
+
+
+def decimal(value):
+    if not re.fullmatch(r"-?[0-9]{1,15}(?:\.[0-9]{1,9})?", value):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and abs(number) <= 1e15 else None
+
+
+def dimensions(value):
+    match = re.fullmatch(r"([0-9]{1,5})x([0-9]{1,5})", value)
+    if not match:
+        return None
+    width, height = map(int, match.groups())
+    return {"width": width, "height": height} if max(width, height) <= 32768 else None
+
+
+BOOL = lambda value: integer(value, 0, 1)
+SIGNED = lambda value: integer(value, -(1 << 63), (1 << 63) - 1)
+STATE = enum("idle", "starting", "loading", "buffering", "playing", "paused", "stopping", "ended", "failed", "unknown")
+ROUTE = enum("direct-http", "playlist-cache", "mirroring", "audio-only", "none", "unknown")
+CODEC = enum("h264", "hevc", "h265", "vp8", "vp9", "av1", "mpeg2video", "mpeg4", "aac", "alac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "pcm", "other", "unknown", "none")
+COMMON = {"session": integer}
+PLAYBACK = dict(COMMON, state=STATE, request=enum("queued", "rejected"), route=ROUTE,
+                start=decimal, codec=CODEC, size=dimensions)
+for key in ("ready child paused seeking position_known audio_position_known cache_known cache_bytes_known "
+            "cache_speed_known avsync_known file_error_known exit_known error_reports_known").split():
+    PLAYBACK[key] = BOOL
+for key in ("position audio_position cache_seconds avsync").split():
+    PLAYBACK[key] = decimal
+for key in ("cache_bytes cache_bytes_per_second decoder_drops output_drops error_code file_error_code exit_code signal").split():
+    PLAYBACK[key] = SIGNED
+for key in ("audio_rate audio_channels video_decode_errors audio_decode_errors demux_errors network_errors "
+            "video_output_errors audio_output_errors other_errors metadata_errors").split():
+    PLAYBACK[key] = integer
+for key in ("actual_paused_known actual_paused core_idle_known core_idle cache_eof_known cache_eof "
+            "cache_underrun_known cache_underrun cache_idle_known cache_idle selected_video_known selected_audio_known "
+            "decoded_parameters_known http_status_known terminal_draining terminal_report video_reader_pts_known video_cache_end_known "
+            "video_cache_duration_known audio_reader_pts_known audio_cache_end_known audio_cache_duration_known "
+            "packet_capture_enabled packet_capture_active packet_capture_complete").split():
+    PLAYBACK[key] = BOOL
+for key in ("schema monotonic_ms decoded_width decoded_height warning_reports video_decode_warnings "
+            "missing_reference_warnings invalid_data_warnings timestamp_warnings audio_output_warnings unknown_warnings "
+            "reason_at_ms http_error_count hls_init_failures hls_segment_failures hls_reload_failures child_pid "
+            "log_overflows event_overflows log_text_rejected ipc_read_budget_exhaustions child_generation terminal_reports_dropped history_write_failures "
+            "packet_capture_started_ms packet_capture_ended_ms packet_capture_errors packet_log_rejected "
+            "audio_packets video_packets audio_packet_bytes video_packet_bytes audio_packets_with_pts video_packets_with_pts "
+            "audio_packet_first_at_ms audio_packet_last_at_ms video_packet_first_at_ms video_packet_last_at_ms "
+            "last_warning_at_ms packet_corrupt_warnings pes_mismatch_warnings demux_read_warnings").split():
+    PLAYBACK[key] = integer
+for key in ("selected_video_id selected_audio_id video_observation_age_ms audio_observation_age_ms cache_observation_age_ms").split():
+    PLAYBACK[key] = SIGNED
+for key in ("video_reader_pts video_cache_end video_cache_duration audio_reader_pts audio_cache_end audio_cache_duration "
+            "audio_packet_first_pts audio_packet_last_pts video_packet_first_pts video_packet_last_pts").split():
+    PLAYBACK[key] = decimal
+PLAYBACK.update(
+    video_decoder=enum("h264", "h264_v4l2m2m", "hevc", "hevc_v4l2m2m", "h265", "vp8", "vp9", "av1", "mpeg2video", "mpeg4", "other", "unknown", "none"),
+    audio_decoder=enum("aac", "aac_fixed", "mp3", "mp3float", "ac3", "eac3", "alac", "flac", "opus", "vorbis", "pcm_s16le", "pcm_s24le", "unknown", "other"),
+    pixel_format=enum("yuv420p", "yuv420p10", "yuv420p10le", "yuv422p", "yuv422p10", "yuv422p10le", "yuv444p", "yuv444p10", "yuv444p10le", "nv12", "drm_prime", "unknown", "other"),
+    hwdec=enum("no", "drm", "drm-copy", "v4l2m2m", "v4l2m2m-copy", "vaapi", "vaapi-copy", "vdpau", "vdpau-copy", "unknown", "other"),
+    vo=enum("gpu", "gpu-next", "drm", "x11", "xv", "null", "unknown", "other"),
+    ao=enum("alsa", "pulse", "pipewire", "jack", "null", "unknown", "other"),
+    end_reason=enum("eof", "stop", "quit", "error", "redirect", "unknown", "other"),
+    decode_policy=enum("software", "pi4-safe", "pi4-hevc-experimental"),
+    control_error=enum("none", "seek-rejected", "volume-rejected", "overlay-rejected", "volume-ack-timeout", "overlay-ack-timeout", "seek-timeout", "other"),
+    failure_stage=enum("unknown", "other", "startup", "ipc", "load", "playback", "control", "stop", "audio-output", "video-output"),
+    http_status=lambda value: integer(value, 0, 599),
+    diagnostic_reason=enum("http-client-error", "http-server-error", "hls-init-failure", "hls-segment-failure", "hls-reload-failure", "missing-reference", "video-decode-error", "invalid-data", "timestamp-discontinuity", "audio-output-underrun", "audio-output-init-error", "audio-decode-error", "pes-size-mismatch", "packet-corrupt", "demux-read-error", "hls-expired-segments", "hls-sequence-change", "virtual-terminal-unavailable", "frame-present-failure", "drm-display-failure", "unknown", "other"),
+    last_warning_reason=enum("http-client-error", "http-server-error", "hls-init-failure", "hls-segment-failure", "hls-reload-failure", "missing-reference", "video-decode-error", "invalid-data", "timestamp-discontinuity", "audio-output-underrun", "audio-output-init-error", "audio-decode-error", "pes-size-mismatch", "packet-corrupt", "demux-read-error", "hls-expired-segments", "hls-sequence-change", "virtual-terminal-unavailable", "frame-present-failure", "drm-display-failure", "unknown", "other"),
+    last_warning_stage=enum("video-decode", "audio-decode", "video-output", "audio-output", "demux", "source", "unclassified", "unknown"))
+
+# These small schemas are deliberately explicit. New trace fields must be added
+# with a type/allowlist and a regression test; unknown fields reject the record.
+CONTROL = dict(COMMON, action=enum("pause", "resume", "seek", "volume", "stop", "playlist-remove", "rate-ignored", "playlist-pause", "handover-stop"),
+               accepted=BOOL, position=decimal, rate=decimal, volume=decimal, value=decimal, monotonic_ms=integer,
+               result=enum("accepted", "rejected", "queued", "complete", "failed", "stale"))
+SESSION = dict(COMMON, event=enum("accepted", "rejected", "replaced", "stopped", "ended", "failed", "preparing", "request", "source-failed", "output-release-begin", "output-release-complete", "output-release-failed", "receiver-rebuilt"),
+               route=ROUTE, backend=enum("mpv", "gstreamer"), previous=integer, monotonic_ms=integer, elapsed_ms=integer,
+               reason=enum("new-request", "sender-stop", "replacement", "eof", "error", "invalid-request", "stale-control", "shutdown", "unknown"))
+PREFIXES = {"MPV playback: ": ("mpv_playback", PLAYBACK),
+            "MPV control: ": ("mpv_control", CONTROL),
+            "Playback session: ": ("playback_session", SESSION)}
+
+
+def parse_diagnostic(message):
+    """Return typed fields or a fixed omission reason; never return input text."""
+    if not isinstance(message, str):
+        return None, "nontext"
+    if len(message) > LINE_LIMIT:
+        return None, "oversized"
+    if not all(32 <= ord(char) <= 126 for char in message):
+        return None, "invalid_characters"
+    if message.startswith(("*** ERROR: ", "*** WARNING: ")):
+        message = message.split(": ", 1)[1]
+    for prefix, (kind, fields) in PREFIXES.items():
+        if not message.startswith(prefix):
+            continue
+        values = {}
+        for token in message[len(prefix):].split(" "):
+            key, separator, raw = token.partition("=")
+            if not separator or key not in fields or key in values or not raw:
+                return None, "invalid_known_record"
+            value = fields[key](raw)
+            if value is None:
+                return None, "invalid_known_record"
+            values[key] = value
+        if not values.get("session"):
+            return None, "invalid_known_record"
+        if kind == "mpv_playback" and not ({"state", "request"} & values.keys()):
+            return None, "invalid_known_record"
+        if kind == "mpv_control" and "action" not in values:
+            return None, "invalid_known_record"
+        if kind == "playback_session" and "event" not in values:
+            return None, "invalid_known_record"
+        if values.get("http_status_known") and not 100 <= values.get("http_status", 0) <= 599:
+            return None, "invalid_known_record"
+        if "schema" in values and values["schema"] != 2:
+            return None, "unknown_record_schema"
+        return {"type": kind, "fields": values}, None
+    return None, "unrecognized"
+
+
+def parse_journal_entry(entry):
+    if not isinstance(entry, dict):
+        return None, "invalid_journal"
+    record, reason = parse_diagnostic(entry.get("MESSAGE"))
+    if record is None:
+        return None, reason
+    boot = entry.get("_BOOT_ID")
+    if not isinstance(boot, str) or not UUID.fullmatch(boot):
+        return None, "invalid_correlation"
+    for source, target in (("_PID", "pid"), ("__REALTIME_TIMESTAMP", "realtime_us"),
+                           ("__MONOTONIC_TIMESTAMP", "monotonic_us")):
+        raw = entry.get(source)
+        value = integer(raw, 1 if target == "pid" else 0, (1 << 63) - 1) if isinstance(raw, str) else None
+        if value is None:
+            return None, "invalid_correlation"
+        record[target] = value
+    record["boot_id"] = boot
+    invocation = entry.get("_SYSTEMD_INVOCATION_ID")
+    if isinstance(invocation, str) and UUID.fullmatch(invocation):
+        record["invocation_id"] = invocation
+    return record, None
+
+
+def collect_records(raw, start_us, end_us, limit=DEFAULT_RECORD_LIMIT):
+    records, omitted = [], Counter()
+    examined = 0
+    oldest = newest = None
+    accepted_boots = set()
+    for line in raw.splitlines():
+        examined += 1
+        if examined > RAW_ENTRY_LIMIT:
+            omitted["entry_limit"] += 1
+            break
+        if len(line) > LINE_LIMIT:
+            omitted["oversized_journal_entry"] += 1
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            omitted["invalid_json"] += 1
+            continue
+        record, reason = parse_journal_entry(entry)
+        if record is not None and start_us <= record["realtime_us"] <= end_us:
+            stamp = record["realtime_us"]
+            oldest = stamp if oldest is None else min(oldest, stamp)
+            newest = stamp if newest is None else max(newest, stamp)
+            accepted_boots.add(record["boot_id"])
+        if record is None:
+            omitted[reason] += 1
+        elif not start_us <= record["realtime_us"] <= end_us:
+            omitted["outside_window"] += 1
+        elif len(records) >= limit:
+            # Keep terminal evidence ahead of repetitive periodic samples.
+            # Input is newest first, so evict the oldest nonterminal retained.
+            replace = next((i for i in range(len(records) - 1, -1, -1)
+                            if not records[i]["fields"].get("terminal_report")), None)
+            if record["fields"].get("terminal_report") and replace is not None:
+                records[replace] = record
+            elif record["fields"].get("terminal_report"):
+                omitted["terminal_record_limit"] += 1
+            omitted["record_limit"] += 1
+        else:
+            records.append(record)
+    # journalctl is requested newest first so limits retain the latest evidence.
+    records.sort(key=lambda record: (record["realtime_us"], record["boot_id"], record["pid"], record["monotonic_us"]))
+    return records, {"entries_examined": min(examined, RAW_ENTRY_LIMIT),
+                     "omitted_by_reason": dict(omitted), "entry_limit_reached": examined > RAW_ENTRY_LIMIT,
+                     "oldest_accepted_realtime_us": oldest, "newest_accepted_realtime_us": newest,
+                     "accepted_boot_count": len(accepted_boots)}
+
+
+def summarize_attempts(records):
+    attempts = {}
+    for record in records:
+        key = record["boot_id"], record["pid"], record["fields"]["session"]
+        item = attempts.setdefault(key, {"boot_id": key[0], "pid": key[1], "generation": key[2],
+                                        "first_monotonic_us": record["monotonic_us"],
+                                        "last_monotonic_us": record["monotonic_us"], "records": 0})
+        item["first_monotonic_us"] = min(item["first_monotonic_us"], record["monotonic_us"])
+        item["last_monotonic_us"] = max(item["last_monotonic_us"], record["monotonic_us"])
+        item["records"] += 1
+        if "state" in record["fields"] and record["monotonic_us"] >= item.get("state_monotonic_us", 0):
+            item["last_observed_state"] = record["fields"]["state"]
+            item["state_monotonic_us"] = record["monotonic_us"]
+        if record["fields"].get("terminal_report") and record["monotonic_us"] >= item.get("final_monotonic_us", 0):
+            item["final_monotonic_us"] = record["monotonic_us"]
+            item["final_state"] = record["fields"].get("state", "unknown")
+            # The complete final record remains in records; these keys identify
+            # it without overwriting final evidence with later idle samples.
+            for key in ("child_pid", "child_generation", "error_code", "file_error_code", "end_reason", "diagnostic_reason"):
+                if key in record["fields"]:
+                    item["final_" + key] = record["fields"][key]
+    return list(attempts.values())
+
+
+def merge_records(journal, retained, limit):
+    """Deduplicate formatted events; keep terminal evidence before samples."""
+    by_event, duplicates = {}, 0
+    for source, rows in (("journal", journal), ("retained", retained)):
+        for row in rows:
+            # The formatter timestamp is shared by journal and file writes;
+            # journal receipt microseconds differ. Older untimestamped records
+            # can only be deduplicated when their envelope timestamps match.
+            timestamp = ("formatted_ms", row["fields"]["monotonic_ms"]) if "monotonic_ms" in row["fields"] else ("envelope_us", row["monotonic_us"])
+            key = (row["boot_id"], row["pid"], timestamp,
+                   json.dumps(row["fields"], sort_keys=True, separators=(",", ":")), row["type"])
+            if key in by_event:
+                duplicates += 1
+                if source not in by_event[key]["sources"]:
+                    by_event[key]["sources"].append(source)
+            else:
+                by_event[key] = dict(row, sources=[source])
+    records = sorted(by_event.values(), key=lambda row: (row["realtime_us"], row["boot_id"], row["pid"], row["monotonic_us"]))
+    terminals = [row for row in records if row["fields"].get("terminal_report")]
+    ordinary = [row for row in records if not row["fields"].get("terminal_report")]
+    selected = terminals[-limit:]
+    available = limit - len(selected)
+    if available:
+        selected.extend(ordinary[-available:])
+    selected.sort(key=lambda row: (row["realtime_us"], row["boot_id"], row["pid"], row["monotonic_us"]))
+    return selected, {"duplicate_records": duplicates, "record_limit_omitted": len(records) - len(selected),
+                      "terminal_record_limit_omitted": max(0, len(terminals) - limit)}
+
+
+def private_directory(path, uid):
+    """Read-only traversal of a fixed directory; reject symlinks and unsafe owners."""
+    path = Path(path)
+    if not path.is_absolute() or len(str(path)) > 4096:
+        raise OSError("unsafe")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in path.parts[1:]:
+            if component in {".", ".."}:
+                raise OSError("unsafe")
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            info = os.fstat(fd)
+            if info.st_uid not in {0, uid} or (info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX)):
+                raise OSError("unsafe")
+        info = os.fstat(fd)
+        if info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
+            raise OSError("unsafe")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def private_file(directory_fd, name, uid, max_size):
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600 or not 0 <= info.st_size <= max_size:
+        os.close(fd)
+        raise OSError("unsafe")
+    return fd
+
+
+def retained_history(service, record_limit=DEFAULT_RECORD_LIMIT):
+    """Read only the service user's standard private state path, never config.
+
+    Retained records are intentionally not expired by the journal time window.
+    A custom XDG_STATE_HOME is not discovered by reading the process environment.
+    """
+    result = {"query_status": "unavailable", "files": {}, "raw_bytes_read": 0,
+              "window": "all bounded retained history, independent of journal time window",
+              "directory_scope": "standard state directory of current service user; custom XDG paths are not searched",
+              "historical_coverage": "unknown; rotation, opt-in start, rejected writes or power loss may leave gaps",
+              "file_byte_limit": RETAINED_FILE_LIMIT, "file_count_limit": 2}
+    uid = service.get("uid")
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+        return [], result
+    directory_fd = lock_fd = None
+    raw_parts = []
+    try:
+        account = pwd.getpwuid(uid)
+        directory_fd = private_directory(Path(account.pw_dir) / ".local/state/uxplay", uid)
+        lock_fd = private_file(directory_fd, ".playback-trace.lock", uid, 0)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            result["query_status"] = "busy"
+            return [], result
+        for index, name in enumerate(RETAINED_FILES):
+            label = "current" if index == 0 else "previous"
+            fd = None
+            try:
+                fd = private_file(directory_fd, name, uid, RETAINED_FILE_LIMIT)
+                parts, length = [], 0
+                while length <= RETAINED_FILE_LIMIT:
+                    part = os.read(fd, min(65536, RETAINED_FILE_LIMIT + 1 - length))
+                    if not part:
+                        break
+                    parts.append(part)
+                    length += len(part)
+                result["raw_bytes_read"] += length
+                if length > RETAINED_FILE_LIMIT:
+                    result["files"][label] = "oversized"
+                    continue
+                raw = b"".join(parts)
+                # A crash may leave a partial last line; never interpret it as
+                # a complete retained record, even if it happens to parse.
+                lines = raw.splitlines()
+                if raw and not raw.endswith(b"\n"):
+                    result["incomplete_lines_omitted"] = result.get("incomplete_lines_omitted", 0) + 1
+                    lines = lines[:-1]
+                raw_parts.extend(reversed(lines))
+                result["files"][label] = "ok"
+            except FileNotFoundError:
+                result["files"][label] = "missing"
+            except OSError:
+                result["files"][label] = "unsafe-or-unavailable"
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        result["query_status"] = "ok" if raw_parts else "no-readable-records"
+    except (OSError, KeyError):
+        result["query_status"] = "unsafe-or-unavailable"
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+    records, counts = collect_records(b"\n".join(raw_parts), 0, (1 << 63) - 1, record_limit)
+    result.update(counts)
+    if counts["oldest_accepted_realtime_us"] is not None:
+        result["oldest_retained_realtime_us"] = counts["oldest_accepted_realtime_us"]
+        result["newest_retained_realtime_us"] = counts["newest_accepted_realtime_us"]
+        result["retained_boot_count"] = counts["accepted_boot_count"]
+        result["timestamps_scope"] = "validated entries examined, before record/export limits; input limits can leave older history unexamined"
+    return records, result
+
+
+def encode_report(report, byte_limit):
+    """Drop oldest accepted records until the entire JSON export fits."""
+    report["journal"]["export_records_omitted"] = 0
+    report["journal"]["export_terminal_records_omitted"] = 0
+    while True:
+        report["attempts"] = summarize_attempts(report["records"])
+        data = (json.dumps(report, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+        if len(data) <= byte_limit:
+            return data
+        if not report["records"]:
+            raise ValueError("Export limit too small for report metadata")
+        remove = max(1, len(report["records"]) // 8)
+        for _ in range(remove):
+            index = next((i for i, record in enumerate(report["records"])
+                          if not record["fields"].get("terminal_report")), 0)
+            removed = report["records"].pop(index)
+            if removed["fields"].get("terminal_report"):
+                report["journal"]["export_terminal_records_omitted"] += 1
+        report["journal"]["export_records_omitted"] += remove
+
+
+def capture(arguments, timeout=5, byte_limit=65536, input_data=None):
+    """Bound child output, input and wall time. Never forward child stderr."""
+    try:
+        process = subprocess.Popen(arguments, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0)
+    except (OSError, ValueError):
+        return "unavailable", b"", None
+    data, offset, status = bytearray(), 0, "ok"
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ, "output")
+        if input_data is not None:
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, "input")
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                status = "timeout"
+                break
+            for key, _ in selector.select(min(.1, remaining)):
+                try:
+                    if key.data == "input":
+                        offset += os.write(key.fd, input_data[offset:offset + 8192])
+                        if offset >= len(input_data):
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                    else:
+                        chunk = os.read(key.fd, min(8192, byte_limit + 1 - len(data)))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        else:
+                            data.extend(chunk)
+                            if len(data) > byte_limit:
+                                status = "output-limit"
+                                break
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    status = "io-error"
+                    break
+            if status != "ok":
+                break
+    if process.poll() is None and status != "ok":
+        os.killpg(process.pid, signal.SIGKILL)
+    try:
+        code = process.wait(timeout=max(.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=2)
+        code, status = process.returncode, "timeout"
+    process.stdout.close()
+    if process.stdin is not None and not process.stdin.closed:
+        process.stdin.close()
+    if status == "ok" and code != 0:
+        status = "command-failed"
+    return status, bytes(data[:byte_limit]), code
+
+
+def small_text(path, limit=8192):
+    try:
+        with Path(path).open("rb") as source:
+            return source.read(limit).decode("utf-8", "strict").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def boot_id():
+    value = small_text("/proc/sys/kernel/random/boot_id").replace("-", "")
+    return value if UUID.fullmatch(value) else None
+
+
+def service_metadata():
+    status, data, _ = capture(["systemctl", "show", UNIT, "--no-pager",
+                               "--property=MainPID,NRestarts,ActiveState,SubState"])
+    result = {"unit": UNIT, "query_status": status}
+    allowed = {"MainPID": integer, "NRestarts": integer,
+               "ActiveState": enum("active", "inactive", "failed", "activating", "deactivating", "reloading"),
+               "SubState": enum("running", "dead", "failed", "start", "start-pre", "stop", "stop-sigterm", "stop-sigkill", "auto-restart", "exited")}
+    for line in data.decode("utf-8", "replace").splitlines():
+        key, _, value = line.partition("=")
+        if key in allowed and allowed[key](value) is not None:
+            result[key] = allowed[key](value)
+    pid = result.get("MainPID", 0)
+    if pid:
+        try:
+            result["uid"] = os.stat(f"/proc/{pid}").st_uid
+            target = Path(os.readlink(f"/proc/{pid}/exe"))
+            parts = target.parts
+            release = parts[-2] if len(parts) >= 4 and parts[-4:-2] == ("uxplay-dev", "releases") and parts[-1] == "uxplay" else None
+            recognized = release is not None and RELEASE.fullmatch(release)
+            baseline = str(target) in {"/usr/local/bin/uxplay", "/usr/local/bin/uxplay-uhf-test"}
+            result["executable_kind"] = "pi-dev-release" if recognized else "baseline" if baseline else "unrecognized"
+            if recognized:
+                result["release"] = release
+                metadata_path = target.parent / "build.json"
+                if not metadata_path.is_symlink():
+                    try:
+                        metadata = json.loads(small_text(metadata_path, 65536))
+                        if isinstance(metadata, dict):
+                            for key in ("config_sha256", "config_fingerprint", "source_sha256"):
+                                value = metadata.get(key)
+                                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+                                    result[key] = value
+                    except (ValueError, RecursionError):
+                        pass
+            if recognized or baseline:
+                digest = hashlib.sha256()
+                with Path(f"/proc/{pid}/exe").open("rb") as source:
+                    remaining = 32 * 1024 * 1024
+                    while remaining:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            result["binary_sha256"] = digest.hexdigest()
+                            break
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+        except OSError:
+            result["executable_kind"] = "unavailable"
+    return result
+
+
+def versions():
+    result = {}
+    for name, arguments, pattern in (
+            ("mpv", ["mpv", "--no-config", "--version"], r"^mpv v?([^ ]+) "),
+            ("ffmpeg", ["ffmpeg", "-hide_banner", "-version"], r"^ffmpeg version ([^ ]+) ")):
+        status, data, _ = capture(arguments, timeout=5)
+        value = None
+        for line in data.decode("utf-8", "replace").splitlines():
+            match = re.match(pattern, line)
+            if match and VERSION.fullmatch(match[1]):
+                value = match[1]
+        result[name] = {"query_status": status, "version": value}
+    return result
+
+
+def process_snapshot(main_pid):
+    """Read procfs counters only. No command lines, socket endpoints or IPC."""
+    def sample():
+        result = []
+        try:
+            paths = sorted((p for p in Path("/proc").iterdir() if p.name.isdigit()), key=lambda p: int(p.name))[:1024]
+        except OSError:
+            return result
+        for path in paths:
+            try:
+                status = dict(line.split(":", 1) for line in small_text(path / "status").splitlines() if ":" in line)
+                pid = int(path.name)
+                parent = int(status.get("PPid", "0"))
+                if pid != main_pid and (parent != main_pid or Path(os.readlink(path / "exe")).name != "mpv"):
+                    continue
+                if len(result) >= 4:
+                    break
+                fields = small_text(path / "stat").rsplit(")", 1)[1].split()
+                state = fields[0] if fields[0] in {"R", "S", "D", "T", "t", "Z", "X", "I"} else "other"
+                item = {"pid": pid, "role": "receiver" if pid == main_pid else "mpv", "state": state,
+                        "threads": int(status.get("Threads", "0")), "cpu_ticks": int(fields[11]) + int(fields[12]),
+                        "start_ticks": int(fields[19]), "thread_states": {}, "wait_channels": {}}
+                states, waits = Counter(), Counter()
+                known_waits = {"futex_do_wait", "hrtimer_nanosleep", "unix_stream_read_generic", "poll_schedule_timeout.constprop.0", "do_epoll_wait", "ep_poll", "wait_woken", "0"}
+                for thread in list((path / "task").iterdir())[:256]:
+                    try:
+                        thread_state = small_text(thread / "stat").rsplit(")", 1)[1].split()[0]
+                        states[thread_state if thread_state in {"R", "S", "D", "T", "t", "Z", "X", "I"} else "other"] += 1
+                        wait = small_text(thread / "wchan", 128)
+                        waits[wait if wait in known_waits else "unavailable_or_other"] += 1
+                    except (OSError, ValueError, IndexError):
+                        continue
+                item["thread_states"], item["wait_channels"] = dict(states), dict(waits)
+                inodes = set()
+                for fd in list((path / "fd").iterdir())[:1024]:
+                    try:
+                        match = re.fullmatch(r"socket:\[([0-9]+)\]", os.readlink(fd))
+                        if match:
+                            inodes.add(match[1])
+                    except OSError:
+                        pass
+                socket_states, rx, tx = Counter(), 0, 0
+                for table in ("tcp", "tcp6"):
+                    for line in small_text(path / "net" / table, 256 * 1024).splitlines()[1:]:
+                        values = line.split()
+                        if len(values) >= 10 and values[9] in inodes:
+                            names = {"01": "established", "08": "close-wait", "0A": "listen"}
+                            socket_states[names.get(values[3], "other")] += 1
+                            queued_tx, queued_rx = values[4].split(":")
+                            tx += int(queued_tx, 16)
+                            rx += int(queued_rx, 16)
+                item["tcp"] = {"states": dict(socket_states), "rx_queue_bytes": rx, "tx_queue_bytes": tx}
+                result.append(item)
+            except (OSError, ValueError, IndexError):
+                continue
+        return result
+    if not main_pid:
+        return {"sample_seconds": 0, "processes": [], "status": "receiver-unavailable"}
+    before = {item["pid"]: item for item in sample()}
+    started = time.monotonic()
+    time.sleep(2)
+    after = sample()
+    elapsed = time.monotonic() - started
+    ticks = os.sysconf("SC_CLK_TCK")
+    for item in after:
+        old = before.get(item["pid"])
+        if old and old["start_ticks"] == item["start_ticks"]:
+            item["cpu_percent"] = round(100 * max(0, item["cpu_ticks"] - old["cpu_ticks"]) / ticks / elapsed, 2)
+    return {"sample_seconds": round(elapsed, 3), "processes": after,
+            "limits": {"processes": 4, "threads_per_process": 256, "fds_per_process": 1024},
+            "notice": "CPU and socket queues do not identify decoder selection or the cause of a playback stall."}
+
+
+def collect(minutes=30, record_limit=DEFAULT_RECORD_LIMIT, export_limit=DEFAULT_EXPORT_LIMIT, processes=False):
+    end_us = time.time_ns() // 1000
+    start_us = end_us - minutes * 60 * 1000000
+    status, data, _ = capture(["journalctl", "-u", UNIT, "--no-pager", "--quiet", "--reverse", "--output=json",
+                               "--output-fields=MESSAGE,__REALTIME_TIMESTAMP,__MONOTONIC_TIMESTAMP,_BOOT_ID,_PID,_SYSTEMD_INVOCATION_ID",
+                               "--lines=" + str(RAW_ENTRY_LIMIT + 1), "--since=@" + str(start_us // 1000000),
+                               "--until=@" + str((end_us + 999999) // 1000000)], timeout=10, byte_limit=RAW_BYTE_LIMIT)
+    records, stats = collect_records(data, start_us, end_us, record_limit)
+    stats.update(query_status=status, raw_bytes_read=len(data), input_truncated=status == "output-limit",
+                 older_omitted_count=None, coverage="recognized structured diagnostics only")
+    service = service_metadata()
+    retained, retained_stats = retained_history(service, record_limit)
+    records, merged_stats = merge_records(records, retained, record_limit)
+    kernel = platform.release()
+    report = {"schema": SCHEMA, "recorded_at": datetime.now(timezone.utc).isoformat(),
+              "window": {"start_realtime_us": start_us, "end_realtime_us": end_us, "minutes": minutes},
+              "limits": {"raw_bytes": RAW_BYTE_LIMIT, "raw_entries": RAW_ENTRY_LIMIT, "line_bytes": LINE_LIMIT,
+                         "records": record_limit, "export_bytes": export_limit},
+              "platform": {"boot_id": boot_id(), "kernel": kernel if VERSION.fullmatch(kernel) else None},
+              "versions": versions(), "service": service, "journal": stats, "records": records,
+              "retained_history": retained_stats, "combined_records": merged_stats,
+              "provenance_scope": "Platform, versions and service metadata describe collection time only. They do not identify the binary/configuration of retained records from another receiver PID or boot.",
+              "notice": "No raw journal, config, command lines, URLs, headers, source media, device access or player IPC exported."}
+    if processes:
+        report["process_snapshot"] = process_snapshot(service.get("MainPID", 0))
+    return encode_report(report, export_limit)
+
+
+def validate_host(host):
+    if not re.fullmatch(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9_.-]*", host or ""):
+        raise ValueError("Use an SSH alias, hostname or user@IPv4 for --host")
+    return host
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", help="Required SSH alias or user@hostname / user@IPv4")
+    parser.add_argument("--minutes", type=int, default=30, help="Journal window, 1–30 minutes (default 30)")
+    parser.add_argument("--max-records", type=int, default=DEFAULT_RECORD_LIMIT)
+    parser.add_argument("--max-bytes", type=int, default=DEFAULT_EXPORT_LIMIT)
+    parser.add_argument("--process-snapshot", action="store_true", help="Add a two-second procfs CPU/thread/socket sample")
+    parser.add_argument("--output", type=Path, help="Local JSON destination (default stdout)")
+    parser.add_argument("--_collect", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if not 1 <= args.minutes <= MAX_WINDOW_MINUTES or not 1 <= args.max_records <= HARD_RECORD_LIMIT or not 16384 <= args.max_bytes <= HARD_EXPORT_LIMIT:
+        parser.error("Window/record/export limits are outside their bounded ranges")
+    if args._collect:
+        if args.host or args.output:
+            parser.error("Internal collection does not accept host or output")
+        sys.stdout.buffer.write(collect(args.minutes, args.max_records, args.max_bytes, args.process_snapshot))
+        return 0
+    try:
+        host = validate_host(args.host)
+        remote = ["python3", "-", "--_collect", "--minutes", str(args.minutes), "--max-records", str(args.max_records), "--max-bytes", str(args.max_bytes)]
+        if args.process_snapshot:
+            remote.append("--process-snapshot")
+        command = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ConnectionAttempts=1",
+                   "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2", host, shlex.join(remote)]
+        status, data, _ = capture(command, timeout=40, byte_limit=args.max_bytes,
+                                   input_data=Path(__file__).read_bytes())
+        if status != "ok":
+            raise ValueError("SSH collection failed or exceeded its limits; no raw output was exported")
+        report = json.loads(data)
+        if not isinstance(report, dict) or report.get("schema") != SCHEMA or len(data) > args.max_bytes:
+            raise ValueError("Collector returned an invalid report")
+        if args.output:
+            args.output.write_bytes(data)
+        else:
+            sys.stdout.buffer.write(data)
+    except (OSError, ValueError, UnicodeDecodeError):
+        print("pi-playback-report: collection or export failed; no raw diagnostic output was displayed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

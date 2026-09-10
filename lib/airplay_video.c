@@ -25,6 +25,7 @@
 
 #include "raop.h"
 #include "airplay_video.h"
+#include "crypto.h"
 
 typedef enum playlist_type_e {
     NONE,
@@ -50,6 +51,7 @@ struct airplay_video_s {
     char *playback_uuid;
     char *uri_prefix;
     char *local_uri_prefix;
+    char cache_id[33];
     char *playback_location;
     char *language_name;
     char *language_code;
@@ -100,6 +102,32 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, cons
     airplay_video->num_uri = 0;
     airplay_video->next_uri = 0;
     return airplay_video;
+}
+
+bool airplay_video_enable_scoped_cache(airplay_video_t *video) {
+    if (!video || !video->local_uri_prefix || video->playback_location || video->master_playlist) return false;
+    if (video->cache_id[0]) return true;
+    unsigned char random[16];
+    if (get_random_bytes(random, sizeof(random)) != 1) return false;
+    char id[33];
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        id[2 * i] = hex[random[i] >> 4];
+        id[2 * i + 1] = hex[random[i] & 15];
+    }
+    id[32] = '\0';
+    size_t length = strlen(video->local_uri_prefix) + strlen("/cache/") + strlen(id) + 1;
+    char *prefix = malloc(length);
+    if (!prefix) return false;
+    snprintf(prefix, length, "%s/cache/%s", video->local_uri_prefix, id);
+    free(video->local_uri_prefix);
+    video->local_uri_prefix = prefix;
+    memcpy(video->cache_id, id, sizeof(id));
+    return true;
+}
+
+const char *airplay_video_get_cache_id(const airplay_video_t *video) {
+    return video && video->cache_id[0] ? video->cache_id : NULL;
 }
 
 // destroy the airplay_video service
@@ -336,7 +364,10 @@ char *get_uri_local_prefix(airplay_video_t *airplay_video) {
 }
 
 int get_next_FCUP_RequestID(airplay_video_t *airplay_video) {    
-    return ++(airplay_video->FCUP_RequestID);
+    if (airplay_video->cache_id[0])
+        airplay_video->FCUP_RequestID = raop_next_scoped_fcup_request_id(airplay_video->raop);
+    else airplay_video->FCUP_RequestID++;
+    return airplay_video->FCUP_RequestID;
 }
 
 int get_current_FCUP_RequestID(const airplay_video_t *airplay_video) {

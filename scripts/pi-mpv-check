@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Report installed Pi/mpv capabilities without media playback or device takeover.
+
+This command does not qualify hardware decoding. It changes no packages,
+services, receiver configuration, display modes or codec policy. It does not
+read receiver configuration or playback logs, or report environment values or
+media URLs.
+"""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import platform
+import re
+import selectors
+import shutil
+import subprocess
+import time
+
+
+LIMIT = 256 * 1024
+
+
+def probe(arguments, timeout=5):
+    """Bounded output and runtime, using an argument list and no shell."""
+    try:
+        process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except (OSError, ValueError):
+        return {"status": "unavailable", "lines": []}
+    data = bytearray()
+    status = "ok"
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                status = "timeout"
+                break
+            ready = selector.select(min(remaining, 0.1))
+            if not ready:
+                if process.poll() is not None:
+                    break
+                continue
+            chunk = process.stdout.read1(min(8192, LIMIT + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > LIMIT:
+                status = "output-limit"
+                break
+    if process.poll() is None and status != "ok":
+        process.kill()
+    try:
+        code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        code = None
+        status = "timeout"
+    process.stdout.close()
+    if status == "ok" and code:
+        status = "command-failed"
+    # Drop URL-bearing lines, even if a modified executable prints them.
+    lines = [line for line in data.decode("utf-8", "replace").splitlines()
+             if "://" not in line and "token=" not in line.lower()]
+    return {"status": status, "lines": lines}
+
+
+def read_text(path, limit=8192):
+    try:
+        with Path(path).open("rb") as source:
+            return source.read(limit).decode("utf-8", "replace").replace("\x00", "").strip()
+    except OSError:
+        return None
+
+
+def digest(path):
+    try:
+        h = hashlib.sha256()
+        with Path(path).open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def mpv_report():
+    executable = shutil.which("mpv")
+    if not executable:
+        return {"available": False}
+    version = probe([executable, "--no-config", "--version"])
+    # Only version lines; do not reproduce arbitrary configuration/build text.
+    version["lines"] = [line for line in version["lines"]
+                        if re.match(r"\s*(mpv |libplacebo |FFmpeg |libav|libsw)", line)]
+    reports = {"available": True, "executable": str(Path(executable).resolve()),
+               "sha256": digest(executable), "version": version}
+    for label, flag in (("hardware_methods", "--hwdec=help"),
+                        ("video_outputs", "--vo=help"), ("audio_outputs", "--ao=help")):
+        reports[label] = probe([executable, "--no-config", "--load-scripts=no", "--ytdl=no", flag])
+    decoders = probe([executable, "--no-config", "--vd=help"])
+    decoders["lines"] = [line for line in decoders["lines"]
+                         if re.search(r"h264|hevc|v4l2|drm", line, re.I)]
+    reports["relevant_video_decoders"] = decoders
+    if platform.system() == "Linux" and shutil.which("ldd"):
+        dependencies = probe(["ldd", executable])
+        dependencies["lines"] = [line.strip() for line in dependencies["lines"]
+                                 if re.search(r"libav(codec|format|util|filter)|libsw(scale|resample)|libplacebo|libdrm", line)]
+        reports["resolved_media_libraries"] = dependencies
+    return reports
+
+
+def ffmpeg_report():
+    executable = shutil.which("ffmpeg")
+    if not executable:
+        return {"available": False}
+    raw = probe([executable, "-hide_banner", "-version"])
+    flags = []
+    for line in raw["lines"]:
+        if line.strip().startswith("configuration:"):
+            flags = re.findall(r"--(?:enable|disable)-(?:v4l2-request|libudev|libdrm|sand|mmal|omx|epoxy)\b", line)
+    raw["lines"] = [line for line in raw["lines"]
+                    if re.match(r"\s*(ffmpeg version |libav|libsw)", line)]
+    decoders = probe([executable, "-hide_banner", "-decoders"])
+    decoders["lines"] = [line for line in decoders["lines"]
+                         if re.search(r"h264|hevc|v4l2", line, re.I)]
+    return {"available": True, "version": raw, "relevant_build_flags": flags,
+            "hardware_device_types": probe([executable, "-hide_banner", "-hwaccels"]),
+            "relevant_video_decoders": decoders}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.parse_args()
+    model = read_text("/proc/device-tree/model") or read_text("/sys/firmware/devicetree/base/model")
+    os_fields = {}
+    for line in (read_text("/etc/os-release") or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in ("ID", "VERSION_ID", "PRETTY_NAME"):
+            os_fields[key] = value.strip('"')
+    report = {
+        "schema": "uxplay-mpv-inventory-v1",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "qualification": "not-run",
+        "notice": "Inventory only. No media, hardware decode or HDMI/audio playback was tested.",
+        "platform": {"model": model, "kernel": platform.release(), "architecture": platform.machine(), "os": os_fields},
+        "mpv": mpv_report(), "ffmpeg": ffmpeg_report(),
+        "video_devices": [{"device": "/dev/" + p.parent.name, "name": read_text(p)}
+                          for p in sorted(Path("/sys/class/video4linux").glob("video*/name"))],
+        "drm_connectors": [{"connector": p.parent.name, "status": read_text(p),
+                            "advertised_modes": (read_text(p.parent / "modes") or "").splitlines()}
+                           for p in sorted(Path("/sys/class/drm").glob("card*-*/status"))],
+        "alsa_cards": (read_text("/proc/asound/cards") or "unavailable").splitlines(),
+    }
+    if shutil.which("dpkg-query"):
+        report["packages"] = probe(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n",
+                                    "mpv", "ffmpeg", "libavcodec*", "libavformat*", "libavutil*",
+                                    "libdrm2", "libegl-mesa0", "mesa-libgallium"])
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -6,6 +6,30 @@ The original upstream README and licenses are retained. General upstream documen
 
 ## Current status — 10 September 2026
 
+The optional mpv backend now handles direct AirPlay video and its audio;
+GStreamer remains the default and continues to handle mirroring and audio-only
+AirPlay. HDMI status/debug modes show receiver readiness, stream information,
+playback progress and bounded diagnostics. See [the mpv development guide](docs/mpv-screen-development.md)
+for configuration and validation history.
+
+On the Pi, fast rendering plus direct H.264 hardware output (`mpv-render-profile
+fast`, `mpv-h264-hwdec v4l2m2m`, `mpv-decode pi4-safe`) substantially improved
+1080p60 playback. The user confirmed smooth picture and sound for an independent
+AirPlay fixture and the original YouTube video on release
+`20260910T193744320774Z-52c2997e3800-dirty`. The sampled YouTube output-drop rate
+fell from about 45 to 8 frames/second with audio/video synchronization restored.
+Some frames still drop; this is not perfect 60 fps or long-run qualification.
+
+Independent HEVC 720p25 MP4 and paced MPEG-TS tests also produced user-confirmed
+picture and sound. HEVC hardware remains disabled; the problematic UHF HEVC
+source and 4K remain unresolved. H.264 seek/stop and HEVC software playback passed
+targeted regression checks after the rendering update. The latest native backend,
+receiver integration and real HTTP test groups passed, along with the default
+GStreamer build and activation/rollback checks. Local stream captures and device
+configuration are excluded from Git.
+
+## Earlier recovery checkpoint — 10 September 2026
+
 The user confirmed working YouTube playback after a silent UHF video stream on release `20260910T132850290330Z-52c2997e3800-dirty`. The sampled UHF HEVC video reached the display sink 1.341 seconds after the receiver's play request. UHF explicitly stopped its separate audio transport before requesting video, then supplied three complete video fragments without real audio samples. **UHF sound remains unresolved.** Receiver startup measurements exclude time spent on the phone before its request, and this does not establish compatibility with every application or 4K stream.
 
 This source includes missing-audio timeline repair, the Pi4 software-HEVC recovery workaround, faster direct-HLS buffering, terminal failed-stream cleanup, case-insensitive headers and bounded audio diagnostics. It also includes subsequently tested request-line fragmentation and FairPlay bounds fixes that have not yet been activated on the Pi. The working legacy HTTP capability profile is retained.

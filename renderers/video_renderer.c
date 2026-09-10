@@ -22,6 +22,9 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
+#include <gst/video/video.h>
+#include <gst/video/video-overlay-composition.h>
 #include "video_renderer.h"
 #include "direct_playback_state.h"
 #include "playback_diagnostics.h"
@@ -62,6 +65,8 @@ static direct_playback_state_t direct_state;
 static gboolean direct_request_pending = FALSE;
 static guint64 direct_generation = 0;
 static gint64 direct_requested_at = 0;
+static screen_info_mode_t screen_mode = SCREEN_INFO_OFF;
+static gboolean screen_output_suspended = FALSE;
 static int type_264 = 0;
 static int type_265 = 0;
 static int type_hls = 0;
@@ -97,11 +102,22 @@ struct video_renderer_s {
     gint buffering_level;
     guint64 direct_generation;
     gboolean direct_started;
+    gboolean screen_seek_pending;
     playback_diagnostics_t *diagnostics;
     hls_gap_repair_t *gap_repair;
     gboolean gap_only_audio;
     GstClockTime startup_buffer_time;
     gulong buffering_handler;
+    guint64 screen_generation;
+    GMutex overlay_lock;
+    GstVideoOverlayComposition *overlay;
+    GstElement *overlay_pipeline, *overlay_source, *overlay_text, *overlay_sink;
+    guint64 overlay_frame;
+    guint overlay_render_failures;
+    gchar overlay_last_text[2048];
+    gboolean overlay_known, overlay_supported, overlay_logged, overlay_failure_logged;
+    gchar overlay_reason[48];
+    gboolean screen_output_announced;
 #ifdef  X_DISPLAY_FIX
     bool use_x11;
     const char * server_name;
@@ -118,6 +134,247 @@ static char hls[]  = "hls";
 static char jpeg[] = "jpeg";
 static gboolean pi4_profile = FALSE;
 static gboolean direct_http_source = FALSE;
+
+/* These pixels are generated offscreen on the main-loop side. The live
+ * pipeline receives no new element or caps constraint: decoder selection and
+ * negotiated memory remain exactly its own. Blending is explicitly a CPU copy
+ * path, never an end-to-end zero-copy claim. */
+#define SCREEN_PANEL_WIDTH 960
+#define SCREEN_PANEL_HEIGHT 300
+
+static gchar *screen_wrap_panel(const gchar *text, guint columns, guint *lines, guint *widest) {
+    GString *wrapped = g_string_new(NULL);
+    guint used = 0;
+    *lines = 1;
+    *widest = 0;
+    const gchar *p = text;
+    while (*p) {
+        if (*p == '\n') {
+            *widest = MAX(*widest, used);
+            g_string_append_c(wrapped, '\n');
+            used = 0; (*lines)++; p++; continue;
+        }
+        if (*p == ' ') { p++; continue; }
+        const gchar *end = p;
+        guint word_width = 0;
+        while (*end && *end != ' ' && *end != '\n') {
+            word_width += g_unichar_iswide(g_utf8_get_char(end)) ? 2 : 1;
+            end = g_utf8_next_char(end);
+        }
+        if (used && used + 1 + word_width > columns) {
+            *widest = MAX(*widest, used);
+            g_string_append_c(wrapped, '\n'); used = 0; (*lines)++;
+        }
+        if (used) { g_string_append_c(wrapped, ' '); used++; }
+        while (p < end) {
+            guint cells = g_unichar_iswide(g_utf8_get_char(p)) ? 2 : 1;
+            if (used && used + cells > columns) {
+                *widest = MAX(*widest, used);
+                g_string_append_c(wrapped, '\n'); used = 0; (*lines)++;
+            }
+            const gchar *next = g_utf8_next_char(p);
+            g_string_append_len(wrapped, p, next - p);
+            used += cells;
+            p = next;
+        }
+    }
+    *widest = MAX(*widest, used);
+    return g_string_free(wrapped, FALSE);
+}
+
+static void screen_overlay_result(video_renderer_t *owner, gboolean supported,
+                                  const gchar *reason) {
+    owner->overlay_known = TRUE;
+    owner->overlay_supported = supported;
+    g_strlcpy(owner->overlay_reason, reason, sizeof(owner->overlay_reason));
+}
+
+static gboolean screen_buffer_is_system_memory(GstBuffer *buffer) {
+    if (!gst_buffer_n_memory(buffer)) return FALSE;
+    for (guint i = 0; i < gst_buffer_n_memory(buffer); i++) {
+        if (!gst_memory_is_type(gst_buffer_peek_memory(buffer, i), "SystemMemory")) return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean screen_overlay_blend(video_renderer_t *owner, GstBuffer *buffer,
+                                     const GstVideoInfo *video_info) {
+    if (!screen_buffer_is_system_memory(buffer)) {
+        const gchar *reason = "Opaque buffer overlay unqualified";
+        for (guint i = 0; i < gst_buffer_n_memory(buffer); i++) {
+            GstMemory *memory = gst_buffer_peek_memory(buffer, i);
+            if (gst_memory_is_type(memory, "dmabuf")) { reason = "DMABuf overlay unqualified"; break; }
+            if (gst_memory_is_type(memory, "GLMemory")) reason = "GLMemory overlay unqualified";
+        }
+        screen_overlay_result(owner, FALSE, reason);
+        return FALSE;
+    }
+    if (!owner->overlay) return TRUE; /* normal mode intentionally has no panel */
+    if (!gst_buffer_is_writable(buffer)) {
+        screen_overlay_result(owner, FALSE, "Buffer is not writable");
+        return FALSE;
+    }
+    GstVideoFrame frame;
+    if (!gst_video_frame_map(&frame, video_info, buffer, GST_MAP_READWRITE)) {
+        screen_overlay_result(owner, FALSE, "Buffer mapping unavailable");
+        return FALSE;
+    }
+    gboolean blended = gst_video_overlay_composition_blend(owner->overlay, &frame);
+    gst_video_frame_unmap(&frame);
+    screen_overlay_result(owner, blended, blended ? "SystemMemory CPU blend" : "Pixel format blend unsupported");
+    return blended;
+}
+
+static void screen_present_video_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer data) {
+    video_renderer_t *owner = data;
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    GstVideoInfo video_info;
+    gboolean raw = caps && gst_video_info_from_caps(&video_info, caps);
+    g_mutex_lock(&owner->overlay_lock);
+    if (!raw) {
+        screen_overlay_result(owner, FALSE, "Raw video caps unavailable");
+    } else if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+        /* Never map/import or copy opaque decoder memory to draw text. */
+        if (owner->overlay && screen_buffer_is_system_memory(buffer)) {
+            buffer = gst_buffer_make_writable(buffer);
+            GST_PAD_PROBE_INFO_DATA(info) = buffer;
+        }
+        screen_overlay_blend(owner, buffer, &video_info);
+    } else if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+        GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+        if (owner->overlay) list = gst_buffer_list_make_writable(list);
+        GST_PAD_PROBE_INFO_DATA(info) = list;
+        for (guint i = 0; i < gst_buffer_list_length(list); i++) {
+            GstBuffer *buffer = gst_buffer_list_get(list, i);
+            if (owner->overlay && screen_buffer_is_system_memory(buffer)) buffer = gst_buffer_list_get_writable(list, i);
+            screen_overlay_blend(owner, buffer, &video_info);
+        }
+    }
+    g_mutex_unlock(&owner->overlay_lock);
+    if (caps) gst_caps_unref(caps);
+}
+
+static gboolean screen_overlay_create(video_renderer_t *owner) {
+#if GST_CHECK_VERSION(1, 10, 0)
+    owner->overlay_pipeline = gst_pipeline_new(NULL);
+    owner->overlay_source = gst_element_factory_make("appsrc", NULL);
+    owner->overlay_text = gst_element_factory_make("textoverlay", NULL);
+    owner->overlay_sink = gst_element_factory_make("appsink", NULL);
+    if (!owner->overlay_pipeline || !owner->overlay_source || !owner->overlay_text || !owner->overlay_sink) {
+        if (owner->overlay_source) gst_object_unref(owner->overlay_source);
+        if (owner->overlay_text) gst_object_unref(owner->overlay_text);
+        if (owner->overlay_sink) gst_object_unref(owner->overlay_sink);
+        if (owner->overlay_pipeline) gst_object_unref(owner->overlay_pipeline);
+        owner->overlay_pipeline = owner->overlay_source = owner->overlay_text = owner->overlay_sink = NULL;
+        return FALSE;
+    }
+    GstVideoInfo info;
+    gst_video_info_set_format(&info, GST_VIDEO_OVERLAY_COMPOSITION_FORMAT_RGB,
+                             SCREEN_PANEL_WIDTH, SCREEN_PANEL_HEIGHT);
+    info.fps_n = 1;
+    info.fps_d = 1;
+    GstCaps *caps = gst_video_info_to_caps(&info);
+    g_object_set(owner->overlay_source, "caps", caps, "format", GST_FORMAT_TIME,
+                 "is-live", FALSE, "block", FALSE, NULL);
+    gst_caps_unref(caps);
+    g_object_set(owner->overlay_text, "text", "", "font-desc", "Monospace 20px", "auto-resize", FALSE,
+                 "halignment", 0, "valignment", 2, "xpad", 18, "ypad", 12,
+                 "line-alignment", 0,
+                 "shaded-background", FALSE, "draw-shadow", FALSE, "draw-outline", FALSE, NULL);
+    gst_util_set_object_arg(G_OBJECT(owner->overlay_text), "wrap-mode", "none");
+    g_object_set(owner->overlay_sink, "sync", FALSE, "max-buffers", 1, "drop", TRUE, NULL);
+    gst_bin_add_many(GST_BIN(owner->overlay_pipeline), owner->overlay_source,
+                     owner->overlay_text, owner->overlay_sink, NULL);
+    if (!gst_element_link_many(owner->overlay_source, owner->overlay_text, owner->overlay_sink, NULL) ||
+        gst_element_set_state(owner->overlay_pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        gst_element_set_state(owner->overlay_pipeline, GST_STATE_NULL);
+        gst_object_unref(owner->overlay_pipeline);
+        owner->overlay_pipeline = owner->overlay_source = owner->overlay_text = owner->overlay_sink = NULL;
+        return FALSE;
+    }
+    return TRUE;
+#else
+    (void) owner;
+    return FALSE;
+#endif
+}
+
+static GstVideoOverlayComposition *screen_overlay_render(video_renderer_t *owner,
+    const gchar *text, guint width, guint height) {
+#if GST_CHECK_VERSION(1, 10, 0)
+    if (!owner->overlay_pipeline && !screen_overlay_create(owner)) return NULL;
+    /* The common formatter returns plain text. Escape Pango independently so
+     * neither markup nor a sender name can become a rendering instruction. */
+    guint font_pixels = screen_mode == SCREEN_INFO_STATUS ? 32 : 20;
+    guint lines = 0, widest = 0;
+    gchar *wrapped = NULL;
+    /* Fit the bounded full snapshot, not a one-line sample. Absolute font
+     * sizes and explicit wrapping avoid textoverlay's auto-resize multiplier
+     * and its wrap width ignoring xpad. Long diagnostic names reduce the font
+     * modestly before any field is clipped. */
+    for (;;) {
+        guint columns = (SCREEN_PANEL_WIDTH - 36) * 100 / (font_pixels * 62);
+        wrapped = screen_wrap_panel(text, columns, &lines, &widest);
+        if (lines * font_pixels * 135 / 100 + 24 <= SCREEN_PANEL_HEIGHT || font_pixels <= 14) break;
+        g_free(wrapped);
+        font_pixels -= 2;
+    }
+    gchar *escaped = g_markup_escape_text(wrapped, -1);
+    gchar *font = g_strdup_printf("Monospace %upx", font_pixels);
+    g_object_set(owner->overlay_text, "font-desc", font, "text", escaped, NULL);
+    g_free(font);
+    g_free(wrapped);
+    g_free(escaped);
+    GstVideoInfo info;
+    gst_video_info_set_format(&info, GST_VIDEO_OVERLAY_COMPOSITION_FORMAT_RGB,
+                             SCREEN_PANEL_WIDTH, SCREEN_PANEL_HEIGHT);
+    GstBuffer *blank = gst_buffer_new_allocate(NULL, info.size, NULL);
+    GstMapInfo map;
+    if (!gst_buffer_map(blank, &map, GST_MAP_WRITE)) { gst_buffer_unref(blank); return NULL; }
+    /* Native composition RGB is BGRA on little endian and ARGB on big endian. */
+    guint backing_width = MIN(SCREEN_PANEL_WIDTH, widest * font_pixels * 62 / 100 + 36);
+    guint backing_height = MIN(SCREEN_PANEL_HEIGHT, lines * font_pixels * 135 / 100 + 24);
+    for (gsize offset = 0; offset + 3 < map.size; offset += 4) {
+        guint x = (offset / 4) % SCREEN_PANEL_WIDTH, y = (offset / 4) / SCREEN_PANEL_WIDTH;
+        guint32 alpha = x < backing_width && y < backing_height ? 0xa0000000 : 0;
+        guint32 pixel = GUINT32_TO_LE(alpha);
+#if G_BYTE_ORDER == G_BIG_ENDIAN
+        pixel = GUINT32_TO_BE(alpha);
+#endif
+        memcpy(map.data + offset, &pixel, sizeof(pixel));
+    }
+    gst_buffer_unmap(blank, &map);
+    GST_BUFFER_PTS(blank) = owner->overlay_frame++ * GST_SECOND;
+    GST_BUFFER_DURATION(blank) = GST_SECOND;
+    if (gst_app_src_push_buffer(GST_APP_SRC(owner->overlay_source), blank) != GST_FLOW_OK) return NULL;
+    GstSample *sample = gst_app_sink_try_pull_sample(GST_APP_SINK(owner->overlay_sink), 250 * GST_MSECOND);
+    if (!sample) return NULL;
+    GstBuffer *pixels = gst_buffer_copy(gst_sample_get_buffer(sample));
+    if (!gst_buffer_get_video_meta(pixels))
+        gst_buffer_add_video_meta(pixels, GST_VIDEO_FRAME_FLAG_NONE,
+            GST_VIDEO_OVERLAY_COMPOSITION_FORMAT_RGB, SCREEN_PANEL_WIDTH, SCREEN_PANEL_HEIGHT);
+    guint render_width = MAX(1u, width * 9 / 10);
+    guint render_height = MAX(1u, render_width * SCREEN_PANEL_HEIGHT / SCREEN_PANEL_WIDTH);
+    render_height = MIN(render_height, MAX(1u, height * 9 / 10));
+    GstVideoOverlayRectangle *rectangle = gst_video_overlay_rectangle_new_raw(pixels,
+        width / 20, height / 20, render_width, render_height, GST_VIDEO_OVERLAY_FORMAT_FLAG_NONE);
+    GstVideoOverlayComposition *composition = rectangle ? gst_video_overlay_composition_new(rectangle) : NULL;
+    if (rectangle) gst_video_overlay_rectangle_unref(rectangle);
+    gst_buffer_unref(pixels);
+    gst_sample_unref(sample);
+    return composition;
+#else
+    (void) owner; (void) text; (void) width; (void) height;
+    return NULL;
+#endif
+}
+
+void video_renderer_configure_screen(screen_info_mode_t mode) {
+    g_rec_mutex_lock(&direct_mutex);
+    screen_mode = mode;
+    g_rec_mutex_unlock(&direct_mutex);
+}
 
 void video_renderer_configure_pi4(logger_t *profile_logger) {
     pi4_profile = TRUE;
@@ -174,6 +431,8 @@ static void direct_fail_session(video_renderer_t *owner) {
     hls_buffer_full = FALSE;
     hls_seek_enabled = FALSE;
     hls_requested_start_position = 0;
+    if (screen_mode != SCREEN_INFO_OFF && owner->screen_generation)
+        screen_status_fail(owner->screen_generation, SCREEN_ERROR_BACKEND);
     GstStateChangeReturn result = gst_element_set_state(owner->pipeline, GST_STATE_NULL);
     logger_log(logger, LOGGER_INFO, "Direct playback: session=%" G_GUINT64_FORMAT
                " stage=failed action=stop state=NULL result=%s", direct_generation,
@@ -427,9 +686,16 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
         g_assert (i < 3);
         renderer_type[i] = (video_renderer_t *) calloc(1, sizeof(video_renderer_t));
         g_assert(renderer_type[i]);
+        g_mutex_init(&renderer_type[i]->overlay_lock);
+        if (screen_mode != SCREEN_INFO_OFF && hls_video) {
+            screen_status_snapshot_t snapshot;
+            screen_status_get_snapshot(&snapshot);
+            renderer_type[i]->screen_generation = snapshot.generation;
+        }
         renderer_type[i]->autovideo = auto_videosink;
         renderer_type[i]->id = i;
         renderer_type[i]->bus = NULL;
+        renderer_type[i]->buffering_level = -1;
         renderer_type[i]->appsrc = NULL;
         renderer_type[i]->textsrc = NULL;
         renderer_type[i]->uri = NULL;
@@ -601,6 +867,14 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
             }
         }
 #endif
+        if (screen_mode != SCREEN_INFO_OFF) {
+            if (!renderer_type[i]->diagnostics)
+                renderer_type[i]->diagnostics = playback_diagnostics_attach(
+                    renderer_type[i]->pipeline, logger, g_get_monotonic_time(),
+                    renderer_type[i]->screen_generation);
+            playback_diagnostics_enable_screen(renderer_type[i]->diagnostics,
+                                                screen_present_video_buffer, renderer_type[i]);
+        }
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);	
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_READY);
         GstState state;
@@ -622,6 +896,8 @@ static void video_renderer_init_unlocked(logger_t *render_logger, const char *se
 }
 
 static void video_renderer_pause_unlocked() {
+    if (screen_mode != SCREEN_INFO_OFF && renderer && renderer->screen_generation)
+        screen_status_event(renderer->screen_generation, SCREEN_EVENT_PAUSED);
     if (hls_video || direct_request_pending) {
         if (direct_state.failed) return;
         direct_state.intent = DIRECT_PLAYBACK_PAUSED;
@@ -638,6 +914,8 @@ static void video_renderer_pause_unlocked() {
 }
 
 static void video_renderer_resume_unlocked() {
+    if (screen_mode != SCREEN_INFO_OFF && renderer && renderer->screen_generation)
+        screen_status_event(renderer->screen_generation, SCREEN_EVENT_RESUMED);
     if (hls_video || direct_request_pending) {
         if (direct_state.failed) return;
         direct_state.intent = DIRECT_PLAYBACK_PLAYING;
@@ -663,6 +941,7 @@ static void video_renderer_resume_unlocked() {
 static void video_renderer_start_unlocked() {
     GstState state;
     const gchar *state_name = NULL;
+    screen_output_suspended = FALSE;
     if (hls_video) {
         if (direct_state.failed || direct_state.intent == DIRECT_PLAYBACK_STOPPED) {
             return; /* A stop received during rebuilding cancels startup. */
@@ -687,6 +966,7 @@ static void video_renderer_start_unlocked() {
     } 
     /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
     for (int i = 0; i < n_renderers; i++) {
+        if (!renderer_type[i]) continue;
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
         gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
         state_name = gst_element_state_get_name(state);
@@ -927,6 +1207,12 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
         renderer->gap_repair = NULL;
         playback_diagnostics_free(renderer->diagnostics);
         renderer->diagnostics = NULL;
+        if (renderer->overlay_pipeline) {
+            gst_element_set_state(renderer->overlay_pipeline, GST_STATE_NULL);
+            gst_object_unref(renderer->overlay_pipeline);
+        }
+        if (renderer->overlay) gst_video_overlay_composition_unref(renderer->overlay);
+        g_mutex_clear(&renderer->overlay_lock);
         gst_object_unref(renderer->bus);
         gst_object_unref(renderer->pipeline);
 #ifdef X_DISPLAY_FIX
@@ -1032,6 +1318,9 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
     }
     if (hls_video && direct_state.failed) return TRUE;
     playback_diagnostics_message(renderer->diagnostics, message);
+    if (screen_mode != SCREEN_INFO_OFF && renderer->screen_generation &&
+        GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
+        screen_status_fail(renderer->screen_generation, SCREEN_ERROR_BACKEND);
     if (hls_video && GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
         direct_fail_session(renderer);
         return TRUE;
@@ -1089,6 +1378,11 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
                 hls_buffer_empty = percent == 0;
                 hls_buffer_full = percent == 100;
                 renderer->buffering_level = percent;
+                if (screen_mode != SCREEN_INFO_OFF && renderer->screen_generation) {
+                    if (percent < 100) screen_status_event(renderer->screen_generation, SCREEN_EVENT_BUFFERING);
+                    else if (direct_state.intent == DIRECT_PLAYBACK_PLAYING)
+                        screen_status_event(renderer->screen_generation, SCREEN_EVENT_RESUMED);
+                }
                 logger_log(logger, LOGGER_DEBUG, "Buffering :%d percent done", percent);
                 direct_apply_state();
             }
@@ -1097,6 +1391,10 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
     case GST_MESSAGE_ASYNC_DONE:
         if (hls_video && GST_MESSAGE_SRC(message) == GST_OBJECT(renderer->pipeline)) {
             direct_state.preroll_complete = true;
+            if (renderer->screen_seek_pending) {
+                renderer->screen_seek_pending = FALSE;
+                screen_status_event(renderer->screen_generation, SCREEN_EVENT_SEEK_COMPLETE);
+            }
             direct_apply_state();
         }
         break;
@@ -1243,7 +1541,7 @@ static gboolean gstreamer_video_pipeline_bus_callback_unlocked(GstBus *bus, GstM
     return TRUE;
 }
 
-int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
+static int video_renderer_choose_codec_unlocked(bool video_is_jpeg, bool video_is_h265) {
     video_renderer_t *renderer_used = NULL;
     g_assert(!hls_video);
     if (video_is_jpeg) {
@@ -1263,12 +1561,21 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
     }
     if (renderer_used == NULL) {
         return -1;
-    } else if (renderer_used == renderer) {
+    } else if (renderer_used == renderer && !screen_output_suspended) {
         return 0;
-    } else if (renderer) {
+    } else if (renderer && renderer_used != renderer) {
         return -1;
     }
     renderer = renderer_used;
+    screen_output_suspended = FALSE;
+    if (screen_mode != SCREEN_INFO_OFF && !renderer->screen_generation) {
+        /* Idle mirror shells have no session when constructed. Bind once,
+         * immediately before their first activation, then never relabel late
+         * buffers as belonging to a replacement sender. */
+        screen_status_snapshot_t snapshot;
+        screen_status_get_snapshot(&snapshot);
+        renderer->screen_generation = snapshot.generation;
+    }
     gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
     GstState old_state, new_state;
     if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
@@ -1392,6 +1699,10 @@ static void video_renderer_seek_unlocked(float position) {
                                               seek_position);
     if (result) {
         g_print("seek succeeded\n");
+        if (screen_mode != SCREEN_INFO_OFF && renderer->screen_generation) {
+            renderer->screen_seek_pending = TRUE;
+            screen_status_event(renderer->screen_generation, SCREEN_EVENT_SEEKING);
+        }
         direct_apply_state();
     } else {
         g_print("seek failed\n");
@@ -1407,7 +1718,10 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
 
 unsigned int video_renderer_listen(void *loop, int id) {
     g_assert(id >= 0 && id < n_renderers);
-    g_assert (renderer_type[id] && renderer_type[id]->bus);
+    /* Codec selection retires unused mirror shells. A canceled reset can
+     * re-enter the loop while an mpv replacement retains output ownership;
+     * registration must not require rebuilding those retired pipelines. */
+    if (!renderer_type[id] || !renderer_type[id]->bus) return 0;
     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
                                             gstreamer_video_pipeline_bus_callback, (gpointer) loop);    
 }
@@ -1511,5 +1825,118 @@ bool video_renderer_eos_watch(void) {
 void video_renderer_hls_set_volume(double volume) {
     g_rec_mutex_lock(&direct_mutex);
     video_renderer_hls_set_volume_unlocked(volume);
+    g_rec_mutex_unlock(&direct_mutex);
+}
+
+int video_renderer_choose_codec(bool video_is_jpeg, bool video_is_h265) {
+    g_rec_mutex_lock(&direct_mutex);
+    int result = video_renderer_choose_codec_unlocked(video_is_jpeg, video_is_h265);
+    g_rec_mutex_unlock(&direct_mutex);
+    return result;
+}
+
+bool video_renderer_suspend_output(void) {
+    g_rec_mutex_lock(&direct_mutex);
+    gboolean released = TRUE;
+    /* Transition every eager mirror/cover-art shell, not just the chosen
+     * renderer. READY/PAUSED kmssink can already hold the DRM device. */
+    for (int i = 0; i < n_renderers; i++) {
+        if (!renderer_type[i]) continue;
+        GstElement *pipeline = renderer_type[i]->pipeline;
+        if (hls_video) renderer_type[i]->direct_started = FALSE;
+        GstStateChangeReturn result = gst_element_set_state(pipeline, GST_STATE_NULL);
+        GstState current = GST_STATE_VOID_PENDING;
+        GstStateChangeReturn settled = gst_element_get_state(pipeline, &current, NULL, 250 * GST_MSECOND);
+        if (result == GST_STATE_CHANGE_FAILURE || settled == GST_STATE_CHANGE_FAILURE || current != GST_STATE_NULL)
+            released = FALSE;
+    }
+    screen_output_suspended = released;
+    g_rec_mutex_unlock(&direct_mutex);
+    return released;
+}
+
+void video_renderer_screen_refresh(void) {
+    g_rec_mutex_lock(&direct_mutex);
+    if (screen_mode == SCREEN_INFO_OFF || !renderer || !renderer->diagnostics || !renderer->screen_generation) {
+        g_rec_mutex_unlock(&direct_mutex);
+        return;
+    }
+    video_renderer_t *owner = renderer;
+    screen_status_snapshot_t snapshot;
+    screen_status_get_snapshot(&snapshot);
+    if (snapshot.generation != owner->screen_generation || !snapshot.session_active) {
+        g_rec_mutex_unlock(&direct_mutex);
+        return;
+    }
+    playback_diagnostics_snapshot_t observed;
+    playback_diagnostics_get_snapshot(owner->diagnostics, &observed);
+    screen_status_video_t video = observed.video;
+    g_strlcpy(video.backend, "GStreamer", sizeof(video.backend));
+    g_strlcpy(video.decode_policy, snapshot.video.decode_policy, sizeof(video.decode_policy));
+    g_mutex_lock(&owner->overlay_lock);
+    video.overlay_known = owner->overlay_known;
+    video.overlay_supported = owner->overlay_supported;
+    g_strlcpy(video.overlay_reason, owner->overlay_reason, sizeof(video.overlay_reason));
+    if (owner->overlay_known && (!owner->overlay_logged ||
+        (!owner->overlay_supported && !owner->overlay_failure_logged))) {
+        logger_log(logger, owner->overlay_supported ? LOGGER_INFO : LOGGER_WARNING,
+            "Screen info: session=%" G_GUINT64_FORMAT " overlay=%s reason=%s decoder_unchanged=1",
+            owner->screen_generation, owner->overlay_supported ? "supported" : "unqualified",
+            owner->overlay_reason);
+        owner->overlay_logged = TRUE;
+        if (!owner->overlay_supported) owner->overlay_failure_logged = TRUE;
+    }
+    g_mutex_unlock(&owner->overlay_lock);
+    screen_status_set_video(owner->screen_generation, &video);
+    if (hls_video) {
+        screen_status_audio_t audio = observed.audio;
+        audio.volume_known = snapshot.audio.volume_known;
+        audio.volume = snapshot.audio.volume;
+        audio.muted = snapshot.audio.muted;
+        screen_status_set_audio(owner->screen_generation, &audio);
+        screen_status_progress_t progress = snapshot.progress;
+        double duration = 0, position = -1, seek_start = 0, seek_duration = 0;
+        float rate = 0;
+        bool empty = false, full = false;
+        video_get_playback_info_unlocked(&duration, &position, &seek_start, &seek_duration,
+                                        &rate, &empty, &full);
+        progress.position_known = position >= 0 && isfinite(position);
+        progress.position_seconds = progress.position_known ? position : 0;
+        progress.duration_known = duration > 0 && isfinite(duration);
+        progress.duration_seconds = progress.duration_known ? duration : 0;
+        /* NO_PREROLL establishes live; unknown duration alone does not. */
+        progress.live_known = direct_state.live;
+        progress.live = direct_state.live;
+        progress.buffer_known = owner->buffering_level >= 0;
+        progress.buffer_percent = owner->buffering_level;
+        screen_status_set_progress(owner->screen_generation, &progress);
+    }
+    if (observed.video.output_buffers > snapshot.video.output_buffers &&
+        !(hls_video && direct_state.buffering && !direct_state.live && !owner->gap_only_audio))
+        screen_status_event(owner->screen_generation, SCREEN_EVENT_OUTPUT_PROGRESS);
+    if (observed.failed) screen_status_fail(owner->screen_generation, SCREEN_ERROR_BACKEND);
+    screen_status_get_snapshot(&snapshot);
+    gchar text[sizeof(owner->overlay_last_text)];
+    screen_status_format(&snapshot, text, sizeof(text), true);
+    if (strcmp(text, owner->overlay_last_text) && video.output_width && video.output_height &&
+        (!video.overlay_known || video.overlay_supported)) {
+        GstVideoOverlayComposition *next = NULL;
+        if (text[0]) next = screen_overlay_render(owner, text, video.output_width, video.output_height);
+        g_mutex_lock(&owner->overlay_lock);
+        if (!text[0] || next) {
+            if (owner->overlay) gst_video_overlay_composition_unref(owner->overlay);
+            owner->overlay = next;
+            g_strlcpy(owner->overlay_last_text, text, sizeof(owner->overlay_last_text));
+            owner->overlay_render_failures = 0;
+        } else {
+            /* A font cache may need more than one bounded pull at startup.
+             * Retry briefly without changing playback or blocking its stream;
+             * a missing plugin or repeated failure is explicitly unqualified. */
+            owner->overlay_render_failures++;
+            if (!owner->overlay_pipeline || owner->overlay_render_failures >= 3)
+                screen_overlay_result(owner, FALSE, "Text renderer unavailable");
+        }
+        g_mutex_unlock(&owner->overlay_lock);
+    }
     g_rec_mutex_unlock(&direct_mutex);
 }

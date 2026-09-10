@@ -188,7 +188,7 @@ def release_path(release_id):
     return no_symlink(RELEASES / identifier(release_id))
 
 
-def build(token, release_id):
+def build(token, release_id, enable_mpv=False):
     require_lock(token)
     destination = release_path(release_id)
     if destination.exists():
@@ -210,6 +210,7 @@ def build(token, release_id):
         launcher = shutil.which("ccache") or ""
         run(["cmake", "-S", str(SOURCE), "-B", str(BUILD),
              "-DCMAKE_BUILD_TYPE=Release", "-DNO_X11_DEPS=ON",
+             "-DUXPLAY_ENABLE_MPV=" + ("ON" if enable_mpv else "OFF"),
              "-DCMAKE_C_COMPILER_LAUNCHER=" + launcher,
              "-DCMAKE_CXX_COMPILER_LAUNCHER=" + launcher], capture=False)
         run(["cmake", "--build", str(BUILD), "--parallel", "2"], capture=False)
@@ -222,7 +223,7 @@ def build(token, release_id):
             "machine": os.uname().machine,
             "kernel": os.uname().release,
             "build_type": "Release", "no_x11_deps": True, "parallel": 2,
-            "ccache": bool(launcher),
+            "ccache": bool(launcher), "mpv_backend": enable_mpv,
             "binary_sha256": hashlib.sha256((stage / "uxplay").read_bytes()).hexdigest(),
             "source_archive_sha256": hashlib.sha256((stage / "source.tar.gz").read_bytes()).hexdigest(),
         })
@@ -232,6 +233,10 @@ def build(token, release_id):
         shutil.rmtree(stage)
         raise
     print("Built release " + release_id + "; the running receiver was not changed.")
+
+
+def build_mpv(token, release_id):
+    build(token, release_id, enable_mpv=True)
 
 
 def service():
@@ -486,12 +491,12 @@ def main(argv):
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), interrupted)
     commands = {"prepare": (prepare, 1), "finish": (finish, 1), "check": (check, 0),
-                "build": (build, 2), "activate": (activate, 2), "rollback": (rollback, 1),
+                "build": (build, 2), "build-mpv": (build_mpv, 2), "activate": (activate, 2), "rollback": (rollback, 1),
                 "stable": (stable, 1), "logs": (logs, 0)}
     if not argv or argv[0] not in commands or len(argv) - 1 != commands[argv[0]][1]:
         raise Failure("Usage: pi_remote.py prepare|finish TOKEN; check; build|activate TOKEN RELEASE_ID; rollback|stable TOKEN; logs")
     function = commands[argv[0]][0]
-    if argv[0] in ("build", "activate", "rollback", "stable"):
+    if argv[0] in ("build", "build-mpv", "activate", "rollback", "stable"):
         operate(function, *argv[1:])
     else:
         function(*argv[1:])

@@ -24,6 +24,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
+#include "playback_diagnostics.h"
 #define SECOND_IN_NSECS 1000000000UL
 
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
@@ -48,6 +49,8 @@ typedef struct audio_renderer_s {
     GstElement *volume;
     GstBus *bus;
     unsigned char ct;
+    playback_diagnostics_t *diagnostics;
+    screen_status_audio_t screen_baseline;
 } audio_renderer_t ;
 static audio_renderer_t *renderer_type[NFORMATS];
 static audio_renderer_t *renderer = NULL;
@@ -257,6 +260,11 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         logger_log(logger, LOGGER_DEBUG, "GStreamer audio pipeline %d: \"%s\"", i+1, launch->str);
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+        if (screen_status_get_mode() != SCREEN_INFO_OFF) {
+            renderer_type[i]->diagnostics = playback_diagnostics_attach(
+                renderer_type[i]->pipeline, logger, 0, audio_trace.generation + 1);
+            playback_diagnostics_enable_screen(renderer_type[i]->diagnostics, NULL, NULL);
+        }
         gst_caps_unref(caps);
         g_object_unref(clock);
     }
@@ -327,6 +335,11 @@ void  audio_renderer_start(unsigned char *ct) {
     audio_trace.active = TRUE;
     int id = -1;
     get_renderer_type(ct, &id);
+    if (id >= 0 && renderer_type[id]->diagnostics) {
+        playback_diagnostics_snapshot_t observed;
+        playback_diagnostics_get_snapshot(renderer_type[id]->diagnostics, &observed);
+        renderer_type[id]->screen_baseline = observed.audio;
+    }
     if (id >= 0 && renderer) {
         if(*ct != renderer->ct) {
             gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
@@ -449,6 +462,8 @@ void audio_renderer_destroy() {
     audio_renderer_stop_unlocked();
     for (int i = 0; i < NFORMATS ; i++ ) {
         if (!renderer_type[i]) continue;
+        playback_diagnostics_free(renderer_type[i]->diagnostics);
+        renderer_type[i]->diagnostics = NULL;
         gst_object_unref (renderer_type[i]->bus);
         renderer_type[i]->bus = NULL;
         gst_object_unref (renderer_type[i]->volume);
@@ -507,4 +522,26 @@ unsigned int audio_renderer_listen(void *loop, int id) {
     g_assert(id >= 0 && id < NFORMATS);
     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
                                             gstreamer_audio_pipeline_bus_callback, (gpointer) loop); 
+}
+
+bool audio_renderer_get_screen_snapshot(screen_status_audio_t *snapshot) {
+    if (!snapshot) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    g_mutex_lock(&audio_renderer_lock);
+    gboolean active = render_audio && renderer && audio_trace.active;
+    if (active && renderer->diagnostics) {
+        playback_diagnostics_snapshot_t observed;
+        playback_diagnostics_get_snapshot(renderer->diagnostics, &observed);
+        *snapshot = observed.audio;
+        snapshot->input_buffers -= MIN(snapshot->input_buffers, renderer->screen_baseline.input_buffers);
+        snapshot->decoded_buffers -= MIN(snapshot->decoded_buffers, renderer->screen_baseline.decoded_buffers);
+        snapshot->output_buffers -= MIN(snapshot->output_buffers, renderer->screen_baseline.output_buffers);
+        if (renderer->volume) {
+            g_object_get(renderer->volume, "volume", &snapshot->volume, NULL);
+            snapshot->volume_known = isfinite(snapshot->volume);
+            snapshot->muted = snapshot->volume_known && snapshot->volume == 0.0;
+        }
+    }
+    g_mutex_unlock(&audio_renderer_lock);
+    return active;
 }

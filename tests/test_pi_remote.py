@@ -131,6 +131,22 @@ class RemoteTests(unittest.TestCase):
             with self.assertRaisesRegex(remote.Failure, "restarted"):
                 remote.healthy(["/expected"])
 
+    def test_mpv_build_selection_is_recorded_and_default_clears_cached_option(self):
+        remote.prepare("owner")
+        (remote.BUILD / "uxplay").write_text("test executable")
+        for enabled in (True, False):
+            release_id = "mpv-on" if enabled else "mpv-off"
+            remote.write_json(remote.SOURCE / ".pi-build.json", {
+                "release_id": release_id, "revision": "abc123", "dirty": True})
+            with patch.object(remote, "run") as run:
+                remote.build("owner", release_id, enable_mpv=enabled)
+            configure = run.call_args_list[0].args[0]
+            self.assertIn("-DUXPLAY_ENABLE_MPV=" + ("ON" if enabled else "OFF"), configure)
+            metadata = remote.read_json(remote.RELEASES / release_id / "build.json")
+            self.assertEqual(metadata["mpv_backend"], enabled)
+            self.assertTrue((remote.RELEASES / release_id / "source.tar.gz").is_file())
+        self.assertFalse(remote.DROPIN.exists())
+
     def test_privileged_commands_keep_the_authentication_terminal(self):
         with patch.object(remote, "run") as run, patch.object(remote.sys.stdin, "isatty", return_value=True):
             remote.authenticate()

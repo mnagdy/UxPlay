@@ -50,7 +50,10 @@ add_library( renderers
              STATIC
              audio_renderer.c
              video_renderer.c
+             screen_status.c
+             screen_status_renderer.c
              playback_diagnostics.c
+             playback_trace_file.c
              hls_gap_repair.c
              mux_renderer.c )
 
@@ -90,4 +93,20 @@ elseif( CMAKE_VERSION VERSION_LESS "3.12" )
   target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )  
 else()		  
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
+endif()
+
+if(UXPLAY_ENABLE_MPV)
+  pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+  include(CheckSymbolExists)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+  check_symbol_exists(posix_spawn_file_actions_addclosefrom_np "spawn.h" UXPLAY_MPV_SPAWN_CLOSEFROM)
+  cmake_pop_check_state()
+  if(UXPLAY_MPV_SPAWN_CLOSEFROM)
+    target_compile_definitions(renderers PRIVATE UXPLAY_MPV_HAVE_SPAWN_CLOSEFROM=1)
+  endif()
+  target_sources(renderers PRIVATE mpv_backend.c)
+  target_compile_definitions(renderers PUBLIC UXPLAY_HAVE_MPV=1)
+  target_link_libraries(renderers PUBLIC PkgConfig::JSONC)
 endif()

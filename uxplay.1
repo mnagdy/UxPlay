@@ -19,7 +19,7 @@ UxPlay 1.73.7: An open\-source AirPlay mirroring (+ audio streaming) server:
 .IP
    n=1,2,.. format = H264/5, ALAC/AAC. Default fn="recording"
 .TP
-\fB\-hls\fR [v]  Support HTTP Live Streaming (HLS), YouTube app video only:
+\fB\-hls\fR [v]  Support direct AirPlay video (HTTP/HLS):
 .IP
    v = 2 or 3 (default 3) optionally selects video player version
 .TP
@@ -29,6 +29,42 @@ UxPlay 1.73.7: An open\-source AirPlay mirroring (+ audio streaming) server:
    a resolution up to 1920x1080, and no frame rate above 60 fps.
    Incompatible variants are removed before playback; no matching variant
    causes playback to be rejected. Direct HTTP streams are unchanged.
+.TP
+\fB\-airplay-video-backend\fR gstreamer|mpv
+Select direct AirPlay video and its associated audio backend. Default: gstreamer.
+Mirroring and RAOP audio remain on GStreamer. mpv requires a build configured
+with UXPLAY_ENABLE_MPV=ON and an installed compatible mpv executable.
+.TP
+\fB\-screen-info\fR off|status|debug
+Show HDMI receiver feedback and optional stream diagnostics. Default: off.
+GStreamer textoverlay and a font are required. Hardware-memory overlay support
+must be qualified on the target; unsupported paths do not force software decoding.
+.TP
+\fB\-mpv-decode\fR software|pi4-safe|pi4-hevc-experimental
+Default: software. pi4-safe additionally requires an explicitly qualified
+mpv-h264-hwdec method; hardware is restricted to H.264. The experimental HEVC
+policy is currently rejected until target-device qualification is complete.
+.TP
+\fB\-mpv-h264-hwdec\fR v4l2m2m|v4l2m2m-copy
+Select the already qualified H.264 method for pi4-safe. Names must be supported
+by the installed mpv build; selecting a name does not prove hardware is active.
+.TP
+\fB\-mpv-executable\fR path
+Select an installed mpv build. Startup preflight checks private IPC without media.
+.TP
+\fB\-mpv-render-profile\fR default|fast
+Select mpv's normal rendering defaults or its fast profile. The fast profile
+uses simpler scaling and disables dithering and some costly processing.
+Default is default. This does not select a decoder or change the display mode.
+.TP
+\fB\-mpv-vo\fR name; \fB\-mpv-gpu-context\fR name; \fB\-mpv-gpu-api\fR name
+Select mpv video output and graphics context. These are independent of GStreamer
+sink settings. For a qualified direct-HDMI setup, typical values are gpu, drm
+and opengl respectively.
+.TP
+\fB\-mpv-drm-device\fR path; \fB\-mpv-drm-connector\fR name; \fB\-mpv-audio-device\fR name
+Use target-verified mpv device names. No device or display-mode change is inferred
+from advertised hardware capability. Backend and screen mode changes require restart.
 .TP
 \fB\-lang\fR xx  HLS language preferences ("fr:es:..", overrides $LANGUAGE)
 .TP

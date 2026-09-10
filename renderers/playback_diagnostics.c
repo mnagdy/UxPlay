@@ -2,6 +2,7 @@
 #include "playback_diagnostics.h"
 #include <gst/audio/audio-format.h>
 #include <gst/video/video-format.h>
+#include <gst/video/video-info.h>
 #include <string.h>
 
 /* A broken stream must not create unbounded observers or diagnostics output. */
@@ -65,6 +66,10 @@ struct playback_diagnostics_s {
     gint64 last_media_us;
     gint64 next_wait_us;
     GstElement *adaptive_demux;
+    gboolean continuous;
+    playback_diagnostics_snapshot_t snapshot;
+    playback_diagnostics_video_presenter_t presenter;
+    gpointer presenter_data;
 };
 
 /* Every stage can be correlated across pipeline replacement. The text after
@@ -172,6 +177,74 @@ static const gchar *buffer_memory_name(GstBuffer *buffer) {
     return result;
 }
 
+/* Factory names are installed code identifiers, never stream metadata. Still
+ * restrict their alphabet and length before putting one on a screen. */
+static void copy_identifier(gchar *out, gsize capacity, const gchar *value) {
+    if (!value) return;
+    for (const gchar *p = value; *p; p++) {
+        if (!g_ascii_isalnum(*p) && *p != '_' && *p != '-' && *p != '.') return;
+    }
+    g_strlcpy(out, value, capacity);
+}
+
+static void snapshot_video(pad_observation_t *observation, GstBuffer *buffer, guint count) {
+    playback_diagnostics_t *d = observation->owner;
+    screen_status_video_t *v = &d->snapshot.video;
+    GstCaps *caps = gst_pad_get_current_caps(observation->pad);
+    const GstStructure *s = caps && gst_caps_is_fixed(caps) && !gst_caps_is_empty(caps) ?
+        gst_caps_get_structure(caps, 0) : NULL;
+    gint width = 0, height = 0, fps_n = 0, fps_d = 0, bits = 0;
+    if (s) {
+        gst_structure_get_int(s, "width", &width);
+        gst_structure_get_int(s, "height", &height);
+        gst_structure_get_fraction(s, "framerate", &fps_n, &fps_d);
+        gst_structure_get_int(s, "bit-depth-luma", &bits);
+    }
+    if (observation->kind == OBSERVE_DECODER_INPUT) {
+        v->input_buffers += count;
+        d->snapshot.last_media_at_us = g_get_monotonic_time();
+        if (s) {
+            g_strlcpy(v->codec, codec_name(s), sizeof(v->codec));
+            g_strlcpy(v->profile, profile_name(s), sizeof(v->profile));
+            if (width > 0) v->width = width;
+            if (height > 0) v->height = height;
+            if (fps_n > 0 && fps_d > 0) { v->fps_num = fps_n; v->fps_den = fps_d; }
+            if (bits > 0 && bits <= 32) v->bit_depth = bits;
+        }
+    } else if (observation->kind == OBSERVE_DECODER_OUTPUT) {
+        v->decoded_buffers += count;
+        copy_identifier(v->decoder, sizeof(v->decoder), observation->factory);
+        /* A decoded buffer proves this decoder is active. An unfamiliar
+         * factory or DMA-BUF alone does not prove hardware acceleration. */
+        if (g_str_has_prefix(observation->factory, "v4l2") ||
+            g_str_has_prefix(observation->factory, "vaapi") ||
+            g_str_has_prefix(observation->factory, "nvh")) {
+            v->hardware_known = TRUE;
+            v->hardware_active = TRUE;
+        } else if (g_str_has_prefix(observation->factory, "avdec_") ||
+                   !strcmp(observation->factory, "vp8dec") || !strcmp(observation->factory, "vp9dec") ||
+                   !strcmp(observation->factory, "openh264dec") || !strcmp(observation->factory, "theoradec")) {
+            v->hardware_known = TRUE;
+            v->hardware_active = FALSE;
+        }
+        g_strlcpy(v->memory, buffer_memory_name(buffer), sizeof(v->memory));
+        /* Raw decoder caps supply dimensions/bit depth when compressed caps
+         * omit them. They remain input-sized, before any downstream scaling. */
+        if (width > 0) v->width = width;
+        if (height > 0) v->height = height;
+        if (fps_n > 0 && fps_d > 0) { v->fps_num = fps_n; v->fps_den = fps_d; }
+        GstVideoInfo video_info;
+        if (caps && gst_video_info_from_caps(&video_info, caps))
+            v->bit_depth = GST_VIDEO_FORMAT_INFO_DEPTH(video_info.finfo, 0);
+    } else {
+        v->output_buffers += count;
+        if (width > 0) v->output_width = width;
+        if (height > 0) v->output_height = height;
+        d->snapshot.last_output_at_us = g_get_monotonic_time();
+    }
+    if (caps) gst_caps_unref(caps);
+}
+
 /* Only fixed, explicitly selected fields are logged. In particular, caps may
  * contain codec data or upstream metadata and must never be stringified here.
  * Inspecting memory types does not map, copy or read the decoded pixel data.
@@ -259,6 +332,13 @@ static void log_audio_caps(pad_observation_t *observation) {
     }
     const gchar *stage = observation->kind == OBSERVE_AUDIO_DECODER_INPUT ? "audio-decoder-input" :
         observation->kind == OBSERVE_AUDIO_DECODER_OUTPUT ? "audio-decoder-output" : "first-audio-sink-buffer";
+    screen_status_audio_t *audio = &d->snapshot.audio;
+    if (observation->kind == OBSERVE_AUDIO_DECODER_INPUT)
+        g_strlcpy(audio->codec, codec, sizeof(audio->codec));
+    if (rate > 0) audio->sample_rate = rate;
+    if (channels > 0) audio->channels = channels;
+    if (observation->kind == OBSERVE_AUDIO_SINK)
+        copy_identifier(audio->output, sizeof(audio->output), observation->factory);
     DLOG(d, LOGGER_INFO, "stage=%s factory=%s elapsed_ms=%" G_GINT64_FORMAT
          " codec=%s rate=%d channels=%d format=%s%s", stage, observation->factory, elapsed_ms(d),
          codec, rate, channels, format,
@@ -269,6 +349,8 @@ static void log_audio_caps(pad_observation_t *observation) {
 static GstPadProbeReturn first_buffer(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
     pad_observation_t *observation = user_data;
     playback_diagnostics_t *d = observation->owner;
+    if (observation->kind == OBSERVE_VIDEO_SINK && d->presenter)
+        d->presenter(pad, info, d->presenter_data);
     GstBuffer *buffer = NULL;
     if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
         buffer = GST_PAD_PROBE_INFO_BUFFER(info);
@@ -286,7 +368,25 @@ static GstPadProbeReturn first_buffer(GstPad *pad, GstPadProbeInfo *info, gpoint
     if (audio_observation(observation->kind) && !audio_media_buffer(buffer)) return GST_PAD_PROBE_OK;
     (void) pad;
     g_mutex_lock(&d->lock);
-    if (observation->persistent) {
+    guint count = GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST ?
+        gst_buffer_list_length(GST_PAD_PROBE_INFO_BUFFER_LIST(info)) : 1;
+    if (observation->kind <= OBSERVE_VIDEO_SINK) snapshot_video(observation, buffer, count);
+    if (audio_observation(observation->kind)) {
+        /* Count real media buffers only, matching the existing audio proof. */
+        guint media_count = 0;
+        if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST) {
+            GstBufferList *list = GST_PAD_PROBE_INFO_BUFFER_LIST(info);
+            for (guint i = 0; i < gst_buffer_list_length(list); i++)
+                if (audio_media_buffer(gst_buffer_list_get(list, i))) media_count++;
+        } else media_count = 1;
+        if (observation->kind == OBSERVE_AUDIO_DECODER_INPUT) {
+            d->snapshot.audio.input_buffers += media_count;
+            d->snapshot.last_media_at_us = g_get_monotonic_time();
+        } else if (observation->kind == OBSERVE_AUDIO_DECODER_OUTPUT)
+            d->snapshot.audio.decoded_buffers += media_count;
+        else d->snapshot.audio.output_buffers += media_count;
+    }
+    if (observation->kind >= OBSERVE_SOURCE) {
         guint64 bytes = GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER_LIST ?
             gst_buffer_list_calculate_size(GST_PAD_PROBE_INFO_BUFFER_LIST(info)) : gst_buffer_get_size(buffer);
         if (observation->kind == OBSERVE_SOURCE) {
@@ -309,10 +409,10 @@ static GstPadProbeReturn first_buffer(GstPad *pad, GstPadProbeInfo *info, gpoint
                 if (keep < size) d->manifest_truncated = TRUE;
             }
         }
-        if (observation->fired) {
-            g_mutex_unlock(&d->lock);
-            return GST_PAD_PROBE_OK;
-        }
+    }
+    if (observation->fired) {
+        g_mutex_unlock(&d->lock);
+        return observation->persistent ? GST_PAD_PROBE_OK : GST_PAD_PROBE_REMOVE;
     }
     observation->fired = TRUE;
     if (observation->kind >= OBSERVE_SOURCE) {
@@ -342,6 +442,18 @@ static GstPadProbeReturn first_buffer(GstPad *pad, GstPadProbeInfo *info, gpoint
     return observation->persistent ? GST_PAD_PROBE_OK : GST_PAD_PROBE_REMOVE;
 }
 
+static void snapshot_counter_available(playback_diagnostics_t *d, observation_kind_t kind) {
+    switch (kind) {
+    case OBSERVE_DECODER_INPUT: d->snapshot.video.input_buffers_known = TRUE; break;
+    case OBSERVE_DECODER_OUTPUT: d->snapshot.video.decoded_buffers_known = TRUE; break;
+    case OBSERVE_VIDEO_SINK: d->snapshot.video.output_buffers_known = TRUE; break;
+    case OBSERVE_AUDIO_DECODER_INPUT: d->snapshot.audio.input_buffers_known = TRUE; break;
+    case OBSERVE_AUDIO_DECODER_OUTPUT: d->snapshot.audio.decoded_buffers_known = TRUE; break;
+    case OBSERVE_AUDIO_SINK: d->snapshot.audio.output_buffers_known = TRUE; break;
+    default: break;
+    }
+}
+
 /* Called with d->lock held. BUFFER probes never execute synchronously in
  * gst_pad_add_probe (unlike IDLE probes), so the callback can take this lock.
  */
@@ -354,7 +466,8 @@ static void observe_pad(playback_diagnostics_t *d, GstElement *element,
     observation->owner = d;
     observation->pad = pad;
     observation->kind = kind;
-    observation->persistent = kind >= OBSERVE_SOURCE;
+    observation->persistent = d->continuous || kind >= OBSERVE_SOURCE;
+    if (d->continuous) snapshot_counter_available(d, kind);
     observation->factory = g_strdup(factory);
     g_ptr_array_add(d->probes, observation);
     observation->probe_id = gst_pad_add_probe(pad,
@@ -475,6 +588,33 @@ playback_diagnostics_t *playback_diagnostics_attach(GstElement *playbin,
     return d;
 }
 
+void playback_diagnostics_enable_screen(playback_diagnostics_t *d,
+    playback_diagnostics_video_presenter_t presenter, gpointer data) {
+    if (!d) return;
+    g_mutex_lock(&d->lock);
+    d->continuous = TRUE;
+    d->presenter = presenter;
+    d->presenter_data = data;
+    for (guint i = 0; i < d->probes->len; i++) {
+        pad_observation_t *observation = g_ptr_array_index(d->probes, i);
+        /* This API is intentionally restricted to pre-start configuration. */
+        g_assert(!observation->fired);
+        observation->persistent = TRUE;
+        snapshot_counter_available(d, observation->kind);
+    }
+    g_mutex_unlock(&d->lock);
+}
+
+void playback_diagnostics_get_snapshot(playback_diagnostics_t *d,
+                                       playback_diagnostics_snapshot_t *snapshot) {
+    if (!snapshot) return;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!d) return;
+    g_mutex_lock(&d->lock);
+    *snapshot = d->snapshot;
+    g_mutex_unlock(&d->lock);
+}
+
 static const gchar *header_value(const GstStructure *headers, const gchar *name) {
     if (!headers) return NULL;
     for (gint i = 0; i < gst_structure_n_fields(headers); i++) {
@@ -591,6 +731,7 @@ void playback_diagnostics_message(playback_diagnostics_t *d, GstMessage *message
         break;
     case GST_MESSAGE_WARNING:
     case GST_MESSAGE_ERROR:
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) d->snapshot.failed = TRUE;
         if (d->error_reports < MAX_ERROR_REPORTS) {
             GError *error = NULL;
             gchar *debug = NULL;
@@ -613,6 +754,23 @@ void playback_diagnostics_message(playback_diagnostics_t *d, GstMessage *message
             g_free(debug);
         }
         break;
+    case GST_MESSAGE_QOS: {
+        GstFormat format;
+        guint64 processed = 0, dropped = 0;
+        gst_message_parse_qos_stats(message, &format, &processed, &dropped);
+        GstObject *source = GST_MESSAGE_SRC(message);
+        GstElementFactory *factory = source && GST_IS_ELEMENT(source) ?
+            gst_element_get_factory(GST_ELEMENT(source)) : NULL;
+        gboolean video_source = factory &&
+            (gst_element_factory_list_is_type(factory, GST_ELEMENT_FACTORY_TYPE_DECODER | GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO) ||
+             gst_element_factory_list_is_type(factory, GST_ELEMENT_FACTORY_TYPE_SINK | GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO));
+        if (video_source && format == GST_FORMAT_BUFFERS) {
+            /* One sink may repeat its cumulative total; do not sum repeats. */
+            d->snapshot.video.dropped_known = TRUE;
+            d->snapshot.video.dropped_frames = MAX(d->snapshot.video.dropped_frames, dropped);
+        }
+        break;
+    }
     case GST_MESSAGE_BUFFERING: {
         gint percent = 0;
         gst_message_parse_buffering(message, &percent);

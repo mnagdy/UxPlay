@@ -19,6 +19,7 @@
 #include <string.h>
 #include <assert.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #include "raop.h"
 #include "raop_rtp.h"
@@ -89,6 +90,9 @@ struct raop_s {
     /* activate support for HLS live streaming */
     bool hls_support;
     bool hls_pi4;
+    bool hls_scoped_cache;
+    int scoped_fcup_request_id;
+    uint64_t reverse_registration_order;
     bool hls_pending;
   
     /* used in digest authentication */
@@ -119,6 +123,7 @@ struct raop_conn_s {
     connection_type_t connection_type; 
 
     char *client_session_id;
+    uint64_t reverse_registration_order;
     bool authenticated;
     bool have_active_remote;
 };
@@ -268,6 +273,23 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
     hls_request =  (host && !cseq && !client_session_id);
+
+    /* Reject stale direct-video controls before classifying a fresh AirPlay
+     * connection: that classification can otherwise stop RAOP services. */
+    if (raop->hls_scoped_cache && !cseq &&
+        (!strcmp(url, "/stop") || !strcmp(url, "/playback-info") ||
+         !strcmp(url, "/rate") || !strncmp(url, "/rate?", 6) ||
+         !strcmp(url, "/scrub") || !strncmp(url, "/scrub?", 7) ||
+         !strcmp(url, "/action"))) {
+        http_response_t *guard = http_response_create();
+        http_response_init(guard, "HTTP/1.1", 200, "OK");
+        if (!http_video_control_is_current(conn, request, guard)) {
+            http_response_finish(guard, NULL, 0);
+            *response = guard;
+            return;
+        }
+        http_response_destroy(guard);
+    }
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq || ble) {
@@ -778,10 +800,17 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
         raop->hls_support = (value > 0 ? true : false);
     } else if (strcmp(plist_item, "hls_pi4") == 0) {
         raop->hls_pi4 = (value > 0);
+    } else if (strcmp(plist_item, "hls_scoped_cache") == 0) {
+        raop->hls_scoped_cache = (value > 0);
     } else {
         retval = -1;
     }	  
     return retval;
+}
+
+int raop_next_scoped_fcup_request_id(raop_t *raop) {
+    if (!raop || raop->scoped_fcup_request_id == INT_MAX) return 0;
+    return ++raop->scoped_fcup_request_id;
 }
 
 void

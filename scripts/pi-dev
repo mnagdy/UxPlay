@@ -114,7 +114,7 @@ class Pi:
                         self.host + ":uxplay-dev/src/"], check=True)
 
 
-def run_workflow(pi, action):
+def run_workflow(pi, action, with_mpv=False):
     if action in {"check", "logs"}:
         pi.remote(action, bootstrap=True)
         return
@@ -132,7 +132,7 @@ def run_workflow(pi, action):
                 print(f"Sending {metadata['source_files']} source files; "
                       f"snapshot {metadata['source_sha256'][:12]}", flush=True)
                 pi.sync(Path(temp))
-            pi.remote("build", token, release_id)
+            pi.remote("build-mpv" if with_mpv else "build", token, release_id)
             if action == "deploy":
                 pi.remote("activate", token, release_id, interactive=True)
             else:
@@ -151,7 +151,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["check", "build", "deploy", "logs", "rollback", "stable"])
     parser.add_argument("--host", help="SSH alias or user@hostname; overrides .pi-dev.json")
+    parser.add_argument("--with-mpv", action="store_true", help="Compile the optional mpv backend for build/deploy")
     args = parser.parse_args(argv)
+    if args.with_mpv and args.action not in {"build", "deploy"}:
+        parser.error("--with-mpv applies only to build or deploy")
     try:
         settings = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
         host = args.host or os.environ.get("UXPLAY_PI_HOST") or settings.get("host")
@@ -160,7 +163,7 @@ def main(argv=None):
         if shutil.which("ssh") is None or shutil.which("rsync") is None:
             raise RuntimeError("This helper requires SSH and rsync on the Mac.")
         with local_lock():
-            run_workflow(Pi(host), args.action)
+            run_workflow(Pi(host), args.action, args.with_mpv)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         print(f"pi-dev: {error}", file=sys.stderr)
         return 1

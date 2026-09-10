@@ -39,6 +39,10 @@ const char *get_playback_uuid(airplay_video_t *airplay_video);
 void set_uri_prefix(airplay_video_t *airplay_video, const char *uri_prefix, size_t len);
 const char *get_uri_prefix(airplay_video_t *airplay_video);
 char *get_uri_local_prefix(airplay_video_t *airplay_video);
+/* Optional per-cache URL namespace. Enable before assigning a playback
+ * location or collecting playlists; identifiers last for this cache object. */
+bool airplay_video_enable_scoped_cache(airplay_video_t *airplay_video);
+const char *airplay_video_get_cache_id(const airplay_video_t *airplay_video);
 void set_playback_location(airplay_video_t *airplay_video, const char *location, size_t len);
 const char *get_playback_location(airplay_video_t *airplay_video);
 /* A reusable direct URL, or a cached HLS master whose media playlists are all

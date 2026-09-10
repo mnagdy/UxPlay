@@ -171,3 +171,7 @@ HTTP and RTSP request header names are matched without regard to ASCII letter ca
 FairPlay setup also rejects unsupported mode indices before reading its response table or changing saved handshake state. The unsupported HTTP `/fp-setup2` route checks body length before reading its version byte and retains its existing 421 response. These guards do not add HTTP FairPlay support or change advertised capabilities.
 
 An isolated [GStreamer key-validation patch](../patches/README.md) and encrypted-stream fixtures address a reproduced dependency failure. This dependency patch is not installed by the ordinary receiver build.
+
+## Optional mpv and HDMI feedback build
+
+Use `./scripts/pi-dev build --with-mpv` to prepare a release with the optional direct-video backend. The receiver remains unchanged until activation. See [configuration, dependencies and validation limits](mpv-screen-development.md); the default build still uses GStreamer and disables the additional screen UI.

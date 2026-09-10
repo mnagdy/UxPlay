@@ -7,8 +7,12 @@
 #undef NDEBUG
 #endif
 #define httpd_get_connection_socket_by_type test_reverse_socket
+#define httpd_get_connection_by_type test_reverse_connection
+#define httpd_get_connection_socket test_connection_socket
 #include "../lib/raop.c"
 #undef httpd_get_connection_socket_by_type
+#undef httpd_get_connection_by_type
+#undef httpd_get_connection_socket
 /* Inspect saved handshake state when malformed requests are rejected. */
 #include "../lib/fairplay_playfair.c"
 
@@ -18,6 +22,9 @@
 #include <unistd.h>
 
 static int reverse_pair[2] = {-1, -1};
+static raop_conn_t *test_reverse_connections[3];
+static int test_reverse_sockets[3];
+static unsigned test_reverse_count;
 static const char session_id[] = "11111111-2222-3333-4444-555555555555";
 static const char playback_uuid[] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 static const char prefix[] = "mlhls://fixture.invalid/current-video";
@@ -41,8 +48,11 @@ static const char media[] =
 typedef struct {
     raop_t raop;
     raop_conn_t conn;
+    raop_conn_t reverse_conn;
     unsigned int play_calls;
     unsigned int reset_calls;
+    unsigned int request_calls, request_error_calls, rate_calls, scrub_calls, stop_calls, info_calls;
+    bool request_direct_http;
     float played_position;
     bool expected_direct_http;
     char played_location[256];
@@ -53,6 +63,19 @@ int test_reverse_socket(httpd_t *httpd, connection_type_t type, int instance) {
     assert(type == CONNECTION_TYPE_PTTH);
     assert(instance == 1);
     return reverse_pair[0];
+}
+
+void *test_reverse_connection(httpd_t *httpd, connection_type_t type, int instance) {
+    (void)httpd;
+    if (type != CONNECTION_TYPE_PTTH || instance < 1 || (unsigned)instance > test_reverse_count) return NULL;
+    return test_reverse_connections[instance - 1];
+}
+
+int test_connection_socket(httpd_t *httpd, void *data) {
+    (void)httpd;
+    for (unsigned i = 0; i < test_reverse_count; i++)
+        if (test_reverse_connections[i] == data) return test_reverse_sockets[i];
+    return -1;
 }
 
 static void test_log(void *cls, int level, const char *message) {
@@ -74,6 +97,23 @@ static void reset_connection(void *cls, int count) {
     ((fixture_t *)cls)->reset_calls++;
 }
 
+static void video_requested(void *cls, bool direct_http) {
+    fixture_t *f = cls;
+    f->request_calls++;
+    f->request_direct_http = direct_http;
+}
+
+static void request_failed(void *cls) { ((fixture_t *)cls)->request_error_calls++; }
+static void rate_changed(void *cls, float rate) { (void)rate; ((fixture_t *)cls)->rate_calls++; }
+static void scrub_changed(void *cls, float position) { (void)position; ((fixture_t *)cls)->scrub_calls++; }
+static void stopped(void *cls) { ((fixture_t *)cls)->stop_calls++; }
+static void playback_info(void *cls, playback_info_t *info) {
+    ((fixture_t *)cls)->info_calls++;
+    memset(info, 0, sizeof(*info));
+    info->duration = 180;
+    info->position = 1;
+}
+
 static void fixture_init(fixture_t *f) {
     memset(f, 0, sizeof(*f));
     f->raop.current_video = -1;
@@ -84,10 +124,22 @@ static void fixture_init(fixture_t *f) {
     logger_set_level(f->raop.logger, LOGGER_INFO);
     f->raop.callbacks.cls = f;
     f->raop.callbacks.on_video_play = played;
+    f->raop.callbacks.on_video_request = video_requested;
+    f->raop.callbacks.on_video_request_error = request_failed;
+    f->raop.callbacks.on_video_rate = rate_changed;
+    f->raop.callbacks.on_video_scrub = scrub_changed;
+    f->raop.callbacks.on_video_stop = stopped;
+    f->raop.callbacks.on_video_acquire_playback_info = playback_info;
     f->raop.callbacks.conn_reset = reset_connection;
     f->conn.raop = &f->raop;
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, reverse_pair) == 0);
     assert(fcntl(reverse_pair[1], F_SETFL, O_NONBLOCK) == 0);
+    f->reverse_conn.raop = &f->raop;
+    f->reverse_conn.client_session_id = (char *)session_id;
+    f->reverse_conn.reverse_registration_order = 1;
+    test_reverse_count = 1;
+    test_reverse_connections[0] = &f->reverse_conn;
+    test_reverse_sockets[0] = reverse_pair[0];
 }
 
 static void fixture_destroy(fixture_t *f) {
@@ -96,6 +148,7 @@ static void fixture_destroy(fixture_t *f) {
     close(reverse_pair[0]);
     close(reverse_pair[1]);
     reverse_pair[0] = reverse_pair[1] = -1;
+    test_reverse_count = 0;
 }
 
 /* Assert exactly whether production sent another reverse HTTP request. */
@@ -159,6 +212,42 @@ static int invoke_request(fixture_t *f, raop_handler_t handler, const char *meth
 
 static int invoke(fixture_t *f, raop_handler_t handler, const char *path, plist_t root) {
     return invoke_request(f, handler, "POST", "HTTP/1.1", path, root);
+}
+
+/* When handler is NULL, exercise the dispatch guard before connection
+ * classification. Such calls below are intentionally stale and must stop
+ * before any live HTTP server/socket state would be needed. */
+static int invoke_plain(fixture_t *f, raop_handler_t handler, const char *method,
+                        const char *path, const char *session, char *reply, size_t capacity) {
+    char header[1024];
+    int length = snprintf(header, sizeof(header), "%s %s HTTP/1.1\r\nHost: localhost:7000\r\n%s%s%sContent-Length: 0\r\n\r\n",
+        method, path, session ? "X-Apple-Session-ID: " : "", session ? session : "", session ? "\r\n" : "");
+    assert(length > 0 && length < (int)sizeof(header));
+    http_request_t *request = http_request_init();
+    assert(http_request_add_data(request, header, length) == 0);
+    assert(http_request_is_complete(request));
+    http_response_t *response = NULL;
+    char *body = NULL;
+    int body_length = 0;
+    if (handler) {
+        response = http_response_create();
+        http_response_init(response, "HTTP/1.1", 200, "OK");
+        handler(&f->conn, request, response, &body, &body_length);
+        http_response_finish(response, body, body_length);
+    } else conn_request(&f->conn, request, &response);
+    assert(response);
+    const char *serialized = http_response_get_data(response, &length);
+    int code = 0;
+    assert(sscanf(serialized, "%*s %d", &code) == 1);
+    if (reply && capacity) {
+        size_t copy = (size_t)length < capacity - 1 ? (size_t)length : capacity - 1;
+        memcpy(reply, serialized, copy);
+        reply[copy] = '\0';
+    }
+    free(body);
+    http_response_destroy(response);
+    http_request_destroy(request);
+    return code;
 }
 
 static void play_request(fixture_t *f) {
@@ -700,7 +789,197 @@ static void test_fairplay_request_lengths(void) {
     fixture_destroy(&f);
 }
 
+static void test_scoped_cache_lifetime_and_loopback(void) {
+    fixture_t f;
+    fixture_init(&f);
+    assert(raop_set_plist(&f.raop, "hls_scoped_cache", 1) == 0);
+    unsigned char local[4] = {127, 0, 0, 1};
+    f.conn.remote = local;
+    f.conn.remotelen = sizeof(local);
+    airplay_video_t *old = start_collection(&f);
+    assert(f.request_calls == 1 && !f.request_direct_http);
+    const char *old_id = airplay_video_get_cache_id(old);
+    assert(old_id && strlen(old_id) == 32);
+    char old_path[128], old_media_path[192], reply[8192];
+    snprintf(old_path, sizeof(old_path), "/cache/%s/master.m3u8", old_id);
+    snprintf(old_media_path, sizeof(old_media_path), "/cache/%s/itag/100/mediadata.m3u8", old_id);
+    assert(strstr(get_master_playlist(old), old_id));
+    assert(action_response(&f, media0, 2, 200, media) == 200);
+    expect_request(media1);
+    assert(action_response(&f, media1, 3, 200, media) == 200);
+    expect_request(media2);
+    assert(action_response(&f, media2, 4, 200, media) == 200);
+    expect_request(NULL);
+    assert(strstr(f.played_location, old_path));
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_path, NULL, reply, sizeof(reply)) == 200);
+    assert(strstr(reply, old_id));
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_media_path, NULL, reply, sizeof(reply)) == 200);
+    assert(strstr(reply, "generated-segment.ts"));
+    play_request(&f); /* Cached resume preserves this cache's URL namespace. */
+    expect_request(NULL);
+    assert(strstr(f.played_location, old_path));
+    int old_slot = f.raop.current_video;
+
+    /* A different current_video must never change what the old URL returns. */
+    int new_slot = (old_slot + 1) % MAX_AIRPLAY_VIDEO;
+    airplay_video_t *replacement = airplay_video_init(&f.raop, 7000, "");
+    assert(replacement && airplay_video_enable_scoped_cache(replacement));
+    assert(strcmp(airplay_video_get_cache_id(replacement), old_id));
+    store_master_playlist(replacement, strdup("#EXTM3U\n#replacement-cache\n"));
+    f.raop.airplay_video[new_slot] = replacement;
+    f.raop.current_video = new_slot;
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_path, NULL, reply, sizeof(reply)) == 200);
+    assert(!strstr(reply, "replacement-cache"));
+    assert(strstr(reply, old_id));
+    assert(invoke_plain(&f, http_handler_hls, "GET", "/master.m3u8", NULL, reply, sizeof(reply)) == 404);
+    assert(invoke_plain(&f, http_handler_hls, "GET", "/cache/../../master.m3u8", NULL, reply, sizeof(reply)) == 404);
+    assert(invoke_plain(&f, http_handler_hls, "POST", old_path, NULL, reply, sizeof(reply)) == 405);
+    unsigned char remote[4] = {192, 168, 1, 2};
+    f.conn.remote = remote;
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_path, NULL, reply, sizeof(reply)) == 403);
+    unsigned char local6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+    f.conn.remote = local6;
+    f.conn.remotelen = sizeof(local6);
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_path, NULL, reply, sizeof(reply)) == 200);
+    raop_destroy_airplay_video(&f.raop, old_slot);
+    assert(invoke_plain(&f, http_handler_hls, "GET", old_path, NULL, reply, sizeof(reply)) == 404);
+    assert(!strstr(reply, "replacement-cache"));
+    fixture_destroy(&f);
+}
+
+static void test_scoped_controls_reject_stale_session(void) {
+    fixture_t f;
+    fixture_init(&f);
+    f.raop.hls_support = true;
+    assert(raop_set_plist(&f.raop, "hls_scoped_cache", 1) == 0);
+    f.expected_direct_http = true;
+    plist_t root = plist_new_dict();
+    plist_dict_set_item(root, "uuid", plist_new_string(playback_uuid));
+    plist_dict_set_item(root, "Content-Location", plist_new_string("http://fixture.invalid/video.mp4"));
+    assert(invoke(&f, http_handler_play, "/play", root) == 200);
+    assert(f.request_calls == 1 && f.request_direct_http);
+    const char stale[] = "99999999-2222-3333-4444-555555555555";
+    const struct { raop_handler_t handler; const char *method; const char *path; } controls[] = {
+        {http_handler_rate, "POST", "/rate?value=0"},
+        {http_handler_scrub, "POST", "/scrub?position=2"},
+        {http_handler_stop, "POST", "/stop"},
+        {http_handler_playback_info, "GET", "/playback-info"}
+    };
+    for (unsigned i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+        assert(invoke_plain(&f, controls[i].handler, controls[i].method, controls[i].path, stale, NULL, 0) == 409);
+        assert(invoke_plain(&f, controls[i].handler, controls[i].method, controls[i].path, NULL, NULL, 0) == 409);
+        assert(invoke_plain(&f, NULL, controls[i].method, controls[i].path, stale, NULL, 0) == 409);
+        assert(invoke_plain(&f, controls[i].handler, controls[i].method, controls[i].path, session_id, NULL, 0) == 200);
+    }
+    assert(f.rate_calls == 1 && f.scrub_calls == 1 && f.stop_calls == 1 && f.info_calls == 1);
+    assert(f.conn.connection_type == CONNECTION_TYPE_UNKNOWN);
+    assert(f.request_error_calls == 0);
+    assert(invoke_plain(&f, http_handler_action, "POST", "/action", stale, NULL, 0) == 409);
+    assert(f.request_error_calls == 0);
+    fixture_destroy(&f);
+}
+
+static void test_early_request_error_callback(void) {
+    fixture_t f;
+    fixture_init(&f);
+    f.raop.hls_scoped_cache = true;
+    play_request(&f);
+    assert(f.request_calls == 1 && f.play_calls == 0 && f.request_error_calls == 0);
+    expect_request(master_url);
+    assert(action_response(&f, master_url, 1, 404, NULL) == 400);
+    assert(f.request_error_calls == 1 && f.play_calls == 0);
+    airplay_video_t *current = hls_get_current_video(&f.raop);
+    plist_t invalid = plist_new_dict();
+    plist_dict_set_item(invalid, "uuid", plist_new_string("bad-uuid"));
+    plist_dict_set_item(invalid, "Content-Location", plist_new_string(master_url));
+    assert(invoke(&f, http_handler_play, "/play", invalid) == 400);
+    assert(f.request_calls == 1 && f.request_error_calls == 1);
+    assert(hls_get_current_video(&f.raop) == current);
+    fixture_destroy(&f);
+}
+
+static void test_scoped_fcup_ids_survive_replacement(void) {
+    fixture_t f;
+    fixture_init(&f);
+    f.raop.hls_scoped_cache = true;
+    airplay_video_t *old = start_collection(&f);
+    assert(get_current_FCUP_RequestID(old) == 2);
+    play_request(&f); /* Same URL/session, but the incomplete cache is replaced. */
+    expect_request(master_url);
+    airplay_video_t *active = hls_get_current_video(&f.raop);
+    assert(get_current_FCUP_RequestID(active) == 3);
+    assert(action_response(&f, master_url, 1, 404, NULL) == 200);
+    expect_request(NULL);
+    assert(f.request_error_calls == 0 && get_num_media_uri(active) == 0);
+    plist_t root = plist_new_dict(), params = plist_new_dict();
+    plist_dict_set_item(root, "type", plist_new_string("unhandledURLResponse"));
+    plist_dict_set_item(params, "FCUP_Response_URL", plist_new_string(master_url));
+    plist_dict_set_item(params, "FCUP_Response_StatusCode", plist_new_uint(404));
+    plist_dict_set_item(root, "params", params); /* Missing correlation ID. */
+    assert(invoke(&f, http_handler_action, "/action", root) == 200);
+    expect_request(NULL);
+    assert(f.request_error_calls == 0 && get_num_media_uri(active) == 0);
+    assert(action_response(&f, master_url, 3, 200, master) == 200);
+    expect_request(media0);
+    assert(get_current_FCUP_RequestID(active) == 4);
+    assert(action_response(&f, media0, 2, 404, NULL) == 200);
+    expect_request(NULL);
+    assert(get_next_media_uri_id(active) == 1 && f.request_error_calls == 0);
+    fixture_destroy(&f);
+
+    fixture_init(&f);
+    f.raop.hls_scoped_cache = true;
+    f.raop.scoped_fcup_request_id = INT_MAX;
+    root = plist_new_dict();
+    plist_dict_set_item(root, "uuid", plist_new_string(playback_uuid));
+    plist_dict_set_item(root, "Content-Location", plist_new_string(master_url));
+    assert(invoke(&f, http_handler_play, "/play", root) == 400);
+    expect_request(NULL);
+    assert(f.request_calls == 1 && f.request_error_calls == 1);
+    fixture_destroy(&f);
+}
+
+static void test_scoped_reverse_socket_follows_session(void) {
+    fixture_t f;
+    fixture_init(&f);
+    f.raop.hls_scoped_cache = true;
+    int other_pair[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, other_pair) == 0);
+    assert(fcntl(other_pair[1], F_SETFL, O_NONBLOCK) == 0);
+    raop_conn_t other = {0};
+    other.client_session_id = "99999999-2222-3333-4444-555555555555";
+    other.reverse_registration_order = 2;
+    test_reverse_count = 2;
+    test_reverse_connections[0] = &other;
+    test_reverse_sockets[0] = other_pair[0];
+    test_reverse_connections[1] = &f.reverse_conn;
+    test_reverse_sockets[1] = reverse_pair[0];
+    assert(fcup_request(&f.conn, master_url, session_id, 1) == 0);
+    expect_request(master_url);
+    char received[8192];
+    assert(recv(other_pair[1], received, sizeof(received), 0) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    /* Reconnecting with the same session chooses its newest registration,
+     * regardless of where the HTTP server reused a connection-table slot. */
+    other.client_session_id = (char *)session_id;
+    assert(fcup_request(&f.conn, master_url, session_id, 2) == 0);
+    expect_request(NULL);
+    int length = recv(other_pair[1], received, sizeof(received) - 1, 0);
+    assert(length > 0);
+    received[length] = '\0';
+    assert(strstr(received, master_url));
+    assert(fcup_request(&f.conn, master_url, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", 3) == -1);
+    expect_request(NULL);
+    close(other_pair[0]);
+    close(other_pair[1]);
+    fixture_destroy(&f);
+}
+
 int main(void) {
+    test_scoped_cache_lifetime_and_loopback();
+    test_scoped_controls_reject_stale_session();
+    test_early_request_error_callback();
+    test_scoped_fcup_ids_survive_replacement();
+    test_scoped_reverse_socket_follows_session();
     test_fairplay_setup_bounds();
     test_fairplay_request_lengths();
     test_server_info_preserves_legacy_http_features();

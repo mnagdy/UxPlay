@@ -35,6 +35,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include "../lib/logger.h"
+#include "screen_status.h"
 
 typedef enum videoflip_e {
     NONE,
@@ -49,6 +50,17 @@ typedef struct video_renderer_s video_renderer_t;
 
 /* Call once after GStreamer initialization, before creating any pipelines. */
 void video_renderer_configure_pi4(logger_t *logger);
+
+/* Configure before renderer initialization. OFF preserves the existing video
+ * pipelines. Refresh is a main-loop operation (about 1 Hz and state changes).
+ * SystemMemory frames support the first overlay; opaque hardware buffers are
+ * reported as unqualified without changing decoder or caps negotiation. */
+void video_renderer_configure_screen(screen_info_mode_t mode);
+void video_renderer_screen_refresh(void);
+/* Release every video pipeline before the idle display takes ownership.
+ * Returns true only when all pipelines report NULL. The caller must release
+ * idle output before start/choose_codec. This cannot bound a kernel ioctl hang. */
+bool video_renderer_suspend_output(void);
 
 void video_renderer_init (logger_t *logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char *rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options,

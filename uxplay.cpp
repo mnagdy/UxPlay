@@ -34,7 +34,10 @@
 #include <cstdio>
 #include <stdarg.h>
 #include <math.h>
+#include <cmath>
 #include <inttypes.h>
+#include <atomic>
+#include <mutex>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -48,6 +51,7 @@
 #include <sys/utsname.h>
 #include <sys/socket.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/types.h>
 #include <pwd.h>
 # ifdef __linux__
@@ -68,6 +72,12 @@
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "renderers/mux_renderer.h"
+#include "renderers/screen_status.h"
+#include "renderers/screen_status_renderer.h"
+#include "renderers/playback_trace_file.h"
+#ifdef UXPLAY_HAVE_MPV
+#include "renderers/mpv_backend.h"
+#endif
 #ifdef DBUS
 #include <dbus/dbus.h>
 #endif
@@ -205,6 +215,29 @@ static std::string audio_rtp_pipeline = "";
 static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
+
+/* Only direct AirPlay video is selectable. Mirroring and RAOP stay on GStreamer. */
+static bool airplay_video_mpv = false;
+static screen_info_mode_t screen_info = SCREEN_INFO_OFF;
+static std::atomic<uint64_t> trace_history_failures(0);
+static screen_status_renderer_t *status_display = NULL;
+static std::mutex display_mutex;
+static bool receiver_registered = false;
+static std::atomic<bool> mpv_owns_output(false);
+static std::atomic<bool> mpv_rebuild_pending(false);
+static std::atomic<bool> mirror_waiting(false);
+static bool mpv_output_prepared = false;
+static std::atomic<bool> playback_output_released(true);
+static std::atomic<uint64_t> mpv_generation(0);
+static std::atomic<uint64_t> playback_generation(0);
+#ifdef UXPLAY_HAVE_MPV
+static mpv_backend_t *mpv_player = NULL;
+static mpv_backend_config_t mpv_config = {};
+static std::string mpv_executable, mpv_vo, mpv_context, mpv_api, mpv_drm_device;
+static std::string mpv_connector, mpv_audio_device, mpv_h264_hwdec;
+static mpv_decode_policy_t mpv_policy = MPV_DECODE_SOFTWARE;
+static bool mpv_fast_rendering = false;
+#endif
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
 static unsigned int scrsv = 0;
@@ -575,7 +608,7 @@ static gboolean x11_window_callback(gpointer loop) {
 
 /* signals handlers (ctrl-c, etc )*/
 
-static void cleanup();
+[[noreturn]] static void cleanup();
 
 #ifdef _WIN32
 static gboolean handle_signal(gpointer data) {
@@ -655,6 +688,552 @@ static gboolean progress_callback (gpointer loop) {
     }
 }
 
+static bool receiver_has_network() {
+#ifndef _WIN32
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) return false;
+    bool available = false;
+    for (struct ifaddrs *it = interfaces; it; it = it->ifa_next) {
+        if (it->ifa_addr && (it->ifa_flags & IFF_UP) && !(it->ifa_flags & IFF_LOOPBACK) &&
+            (it->ifa_addr->sa_family == AF_INET || it->ifa_addr->sa_family == AF_INET6)) {
+            available = true; break;
+        }
+    }
+    freeifaddrs(interfaces);
+    return available;
+#else
+    return raop && raop_is_running(raop);
+#endif
+}
+
+/* Only fixed, typed records use this path. The ordinary protocol logger is
+ * deliberately excluded from the bounded on-disk playback history. */
+static void trace_playback_record(const char *format, ...) {
+    char text[6144];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    LOGI("%s", text);
+#ifndef UXPLAY_RECEIVER_TEST
+    if (screen_info == SCREEN_INFO_DEBUG) {
+        static std::atomic<bool> unavailable_reported(false);
+        if (!playback_trace_file_write(text)) {
+            ++trace_history_failures;
+            if (!unavailable_reported.exchange(true))
+                LOGE("Playback diagnostic history has lost a record; check report history availability and write failures");
+        }
+    }
+#endif
+}
+
+static uint64_t screen_generation() {
+    screen_status_snapshot_t snapshot;
+    screen_status_get_snapshot(&snapshot);
+    return snapshot.generation;
+}
+
+static void screen_set_backend(bool direct_video) {
+    screen_status_snapshot_t current;
+    screen_status_get_snapshot(&current);
+    screen_status_video_t video = {};
+    const char *backend = direct_video && airplay_video_mpv ? "mpv" : "GStreamer";
+    g_strlcpy(video.backend, backend, sizeof(video.backend));
+    const char *policy = hls_pi4 ? "hls-pi4" : "GStreamer default";
+#ifdef UXPLAY_HAVE_MPV
+    if (direct_video && airplay_video_mpv) policy = mpv_policy == MPV_DECODE_SOFTWARE ? "software" :
+        mpv_policy == MPV_DECODE_PI4_SAFE ? "pi4-safe" : "pi4-hevc-experimental";
+#endif
+    g_strlcpy(video.decode_policy, policy, sizeof(video.decode_policy));
+    screen_status_set_video(current.generation, &video);
+}
+
+static bool hide_status_display() {
+    if (!status_display || screen_status_renderer_hide(status_display)) return true;
+    screen_status_event(screen_generation(), SCREEN_EVENT_RECOVERY_REQUIRED);
+    LOGE("Display release was not confirmed; refusing a competing video output");
+    return false;
+}
+
+static void show_status_display() {
+    if (status_display && !screen_status_renderer_show(status_display)) {
+        screen_status_fail(screen_generation(), SCREEN_ERROR_OUTPUT);
+        LOGE("Could not display receiver status; see the receiver log");
+    }
+}
+
+/* These protocol setup callbacks need a result before starting RTP. They
+ * enqueue stop, then wait at most six seconds while the owning main loop
+ * performs IPC, escalation, reaping and display release. This synchronous
+ * setup wait can delay the shared HTTP server; ordinary play/control callbacks
+ * remain queued. A fully asynchronous setup path needs bounded early-RTP
+ * buffering and is deferred from this first build. */
+static bool wait_for_mpv_release() {
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player && mpv_owns_output) {
+        mirror_waiting = true;
+        mpv_backend_stop(mpv_player, mpv_generation);
+        const gint64 deadline = g_get_monotonic_time() + 6 * G_USEC_PER_SEC;
+        while (mpv_owns_output && g_get_monotonic_time() < deadline) g_usleep(10000);
+        mirror_waiting = false;
+        if (mpv_owns_output) {
+            screen_status_event(screen_generation(), SCREEN_EVENT_RECOVERY_REQUIRED);
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
+#ifdef UXPLAY_HAVE_MPV
+static const char *mpv_trace_codec(const char *codec) {
+    const char *known[] = {"h264", "hevc", "av1", "vp8", "vp9", "mpeg2video", "mpeg4"};
+    if (!codec[0]) return "unknown";
+    for (const char *name : known) if (!strcmp(codec, name)) return name;
+    return "other";
+}
+
+static const char *mpv_trace_state(mpv_backend_state_t state) {
+    switch (state) {
+    case MPV_BACKEND_IDLE: return "idle";
+    case MPV_BACKEND_STARTING: return "starting";
+    case MPV_BACKEND_LOADING: return "loading";
+    case MPV_BACKEND_BUFFERING: return "buffering";
+    case MPV_BACKEND_PLAYING: return "playing";
+    case MPV_BACKEND_PAUSED: return "paused";
+    case MPV_BACKEND_STOPPING: return "stopping";
+    case MPV_BACKEND_ENDED: return "ended";
+    case MPV_BACKEND_FAILED: return "failed";
+    default: return "unknown";
+    }
+}
+
+static const char *mpv_trace_label(const char *value, const char *allowed) {
+    if (!value[0] || strlen(value) > 95) return "unknown";
+    for (const char *p = value; *p; ++p)
+        if (!g_ascii_isalnum(*p) && *p != '-' && *p != '_') return "other";
+    char token[100];
+    g_snprintf(token, sizeof(token), "|%s|", value);
+    return strstr(allowed, token) ? value : "other";
+}
+
+static const char *mpv_trace_reason(const char *value) {
+    return mpv_trace_label(value, "|http-client-error|http-server-error|hls-init-failure|hls-segment-failure|hls-reload-failure|missing-reference|video-decode-error|invalid-data|timestamp-discontinuity|audio-output-underrun|audio-output-init-error|audio-decode-error|pes-size-mismatch|packet-corrupt|demux-read-error|hls-expired-segments|hls-sequence-change|virtual-terminal-unavailable|frame-present-failure|drm-display-failure|unknown|");
+}
+
+static const char *mpv_trace_control_error(const char *value) {
+    if (!value[0]) return "none";
+    if (!strcmp(value, "mpv rejected seek")) return "seek-rejected";
+    if (!strcmp(value, "mpv rejected volume control")) return "volume-rejected";
+    if (!strcmp(value, "mpv rejected the diagnostic overlay")) return "overlay-rejected";
+    if (!strcmp(value, "mpv volume acknowledgement timed out")) return "volume-ack-timeout";
+    if (!strcmp(value, "mpv overlay acknowledgement timed out")) return "overlay-ack-timeout";
+    if (!strcmp(value, "mpv seek completion timed out")) return "seek-timeout";
+    return "other";
+}
+
+static void trace_mpv_control(uint64_t generation, const char *action, bool accepted, double value) {
+    if (!generation) return; /* No player attempt exists yet. */
+    trace_playback_record("MPV control: session=%" G_GUINT64_FORMAT " action=%s accepted=%d value=%.3f monotonic_ms=%" G_GINT64_FORMAT,
+         (guint64)generation, action, accepted, std::isfinite(value) ? value : 0.0,
+         (gint64)(g_get_monotonic_time() / 1000));
+}
+
+/* A first timestamp, including zero, is a baseline. Only a later advancing
+ * timestamp is progress; neither observation establishes physical output. */
+struct mpv_progress_observer_t {
+    uint64_t generation = 0;
+    double position = 0;
+    bool baseline = false;
+    gint64 started_at = 0, advanced_at = 0;
+};
+
+static bool observe_mpv_progress(mpv_progress_observer_t &o,
+                                 const mpv_backend_snapshot_t &p, gint64 now) {
+    if (o.generation != p.generation) {
+        o = mpv_progress_observer_t();
+        o.generation = p.generation;
+        o.started_at = now;
+    }
+    const bool can_advance = !p.seeking && !p.requested_paused &&
+        !(p.actual_paused_known && p.actual_paused);
+    const bool advanced = can_advance && p.position_known && o.baseline &&
+        p.position > o.position + 0.001;
+    if (advanced) o.advanced_at = now;
+    o.baseline = p.position_known && can_advance;
+    o.position = p.position;
+    return advanced;
+}
+
+/* Every string in this trace comes from a local allowlist. Only typed
+ * measurements cross from mpv; no source location or raw player text does. */
+static void format_mpv_trace(const mpv_backend_snapshot_t &p, char *text, size_t capacity, bool terminal_report = false) {
+    g_snprintf(text, capacity,
+        "MPV playback: session=%" G_GUINT64_FORMAT " state=%s ready=%d child=%d paused=%d seeking=%d"
+        " codec=%s size=%dx%d position_known=%d position=%.3f audio_position_known=%d audio_position=%.3f"
+        " cache_known=%d cache_seconds=%.3f cache_bytes_known=%d cache_bytes=%" G_GINT64_FORMAT
+        " cache_speed_known=%d cache_bytes_per_second=%" G_GINT64_FORMAT
+        " decoder_drops=%" G_GINT64_FORMAT " output_drops=%" G_GINT64_FORMAT
+        " audio_rate=%d audio_channels=%d avsync_known=%d avsync=%.3f"
+        " error_code=%d file_error_known=%d file_error_code=%d exit_known=%d exit_code=%d signal=%d"
+        " error_reports_known=%d video_decode_errors=%" G_GUINT64_FORMAT
+        " audio_decode_errors=%" G_GUINT64_FORMAT " demux_errors=%" G_GUINT64_FORMAT
+        " network_errors=%" G_GUINT64_FORMAT " video_output_errors=%" G_GUINT64_FORMAT
+        " audio_output_errors=%" G_GUINT64_FORMAT " other_errors=%" G_GUINT64_FORMAT
+        " metadata_errors=%" G_GUINT64_FORMAT,
+        (guint64)p.generation, mpv_trace_state(p.state), p.ready, p.child_alive, p.requested_paused, p.seeking,
+        mpv_trace_codec(p.video_codec), p.width, p.height, p.position_known, p.position,
+        p.audio_position_known, p.audio_position, p.cache_duration_known, p.cache_duration,
+        p.cache_bytes_known, (gint64)p.cache_bytes, p.cache_speed_known, (gint64)p.cache_speed,
+        (gint64)p.dropped_frames, (gint64)p.output_dropped_frames, p.audio_samplerate, p.audio_channels,
+        p.avsync_known, p.avsync, p.error_code, p.file_error_code_known, p.file_error_code,
+        p.child_exit_known, p.child_exit_code, p.child_signal, p.log_messages_active,
+        (guint64)p.video_decode_errors, (guint64)p.audio_decode_errors, (guint64)p.demux_errors,
+        (guint64)p.network_errors, (guint64)p.video_output_errors, (guint64)p.audio_output_errors,
+        (guint64)p.unclassified_errors, (guint64)p.metadata_observation_errors);
+    const size_t used = strlen(text);
+    if (used >= capacity) return;
+    g_snprintf(text + used, capacity - used,
+        " schema=2 monotonic_ms=%" G_GINT64_FORMAT
+        " actual_paused_known=%d actual_paused=%d core_idle_known=%d core_idle=%d"
+        " cache_eof_known=%d cache_eof=%d cache_underrun_known=%d cache_underrun=%d cache_idle_known=%d cache_idle=%d"
+        " selected_video_known=%d selected_video_id=%" G_GINT64_FORMAT
+        " selected_audio_known=%d selected_audio_id=%" G_GINT64_FORMAT
+        " decoded_parameters_known=%d decoded_width=%d decoded_height=%d"
+        " video_observation_age_ms=%" G_GINT64_FORMAT " audio_observation_age_ms=%" G_GINT64_FORMAT
+        " cache_observation_age_ms=%" G_GINT64_FORMAT
+        " video_decoder=%s audio_decoder=%s pixel_format=%s hwdec=%s vo=%s ao=%s"
+        " end_reason=%s warning_reports=%" G_GUINT64_FORMAT " video_decode_warnings=%" G_GUINT64_FORMAT
+        " missing_reference_warnings=%" G_GUINT64_FORMAT " invalid_data_warnings=%" G_GUINT64_FORMAT
+        " timestamp_warnings=%" G_GUINT64_FORMAT " audio_output_warnings=%" G_GUINT64_FORMAT
+        " unknown_warnings=%" G_GUINT64_FORMAT " diagnostic_reason=%s reason_at_ms=%" G_GUINT64_FORMAT
+        " http_status_known=%d http_status=%d http_error_count=%" G_GUINT64_FORMAT
+        " hls_init_failures=%" G_GUINT64_FORMAT " hls_segment_failures=%" G_GUINT64_FORMAT " hls_reload_failures=%" G_GUINT64_FORMAT,
+        (gint64)(g_get_monotonic_time()/1000),
+        p.actual_paused_known, p.actual_paused, p.core_idle_known, p.core_idle,
+        p.cache_eof_known, p.cache_eof, p.cache_underrun_known, p.cache_underrun, p.cache_idle_known, p.cache_idle,
+        p.selected_video_known, (gint64)p.selected_video_id, p.selected_audio_known, (gint64)p.selected_audio_id,
+        p.decoded_parameters_known, p.decoded_width, p.decoded_height,
+        (gint64)p.video_observation_age_ms, (gint64)p.audio_observation_age_ms, (gint64)p.cache_observation_age_ms,
+        mpv_trace_label(p.video_decoder, "|h264|h264_v4l2m2m|hevc|hevc_v4l2m2m|vp8|vp9|av1|mpeg2video|mpeg4|"),
+        mpv_trace_label(p.audio_decoder, "|aac|aac_fixed|mp3|mp3float|ac3|eac3|alac|flac|opus|vorbis|pcm_s16le|pcm_s24le|"),
+        mpv_trace_label(p.pixel_format, "|yuv420p|yuv420p10|yuv420p10le|yuv422p|yuv422p10|yuv422p10le|yuv444p|yuv444p10|yuv444p10le|nv12|drm_prime|"),
+        mpv_trace_label(p.hwdec_current, "|no|drm|drm-copy|v4l2m2m|v4l2m2m-copy|vaapi|vaapi-copy|vdpau|vdpau-copy|"),
+        mpv_trace_label(p.video_output, "|gpu|gpu-next|drm|x11|xv|null|"),
+        mpv_trace_label(p.audio_output, "|alsa|pulse|pipewire|jack|null|"),
+        mpv_trace_label(p.end_reason, "|eof|stop|quit|error|redirect|unknown|"),
+        (guint64)p.log_warnings, (guint64)p.video_decode_warnings, (guint64)p.missing_reference_warnings,
+        (guint64)p.invalid_data_warnings, (guint64)p.timestamp_warnings, (guint64)p.audio_output_warnings,
+        (guint64)p.unknown_warnings,
+        mpv_trace_reason(p.diagnostic_reason),
+        (guint64)p.diagnostic_reason_at_ms, p.last_http_status_known, p.last_http_status, (guint64)p.http_error_count,
+        (guint64)p.hls_init_failures, (guint64)p.hls_segment_failures, (guint64)p.hls_reload_failures);
+    const size_t health_used = strlen(text);
+    if (health_used >= capacity) return;
+    g_snprintf(text + health_used, capacity - health_used,
+        " child_pid=%d child_generation=%" G_GUINT64_FORMAT " terminal_report=%d terminal_reports_dropped=%" G_GUINT64_FORMAT
+        " history_write_failures=%" G_GUINT64_FORMAT
+        " decode_policy=%s control_error=%s failure_stage=%s terminal_draining=%d log_overflows=%" G_GUINT64_FORMAT
+        " event_overflows=%" G_GUINT64_FORMAT " log_text_rejected=%" G_GUINT64_FORMAT
+        " ipc_read_budget_exhaustions=%" G_GUINT64_FORMAT
+        " video_reader_pts_known=%d video_reader_pts=%.3f video_cache_end_known=%d video_cache_end=%.3f"
+        " video_cache_duration_known=%d video_cache_duration=%.3f"
+        " audio_reader_pts_known=%d audio_reader_pts=%.3f audio_cache_end_known=%d audio_cache_end=%.3f"
+        " audio_cache_duration_known=%d audio_cache_duration=%.3f",
+        p.child_pid, (guint64)p.child_generation, terminal_report, (guint64)p.terminal_reports_dropped,
+        (guint64)trace_history_failures.load(),
+        mpv_policy == MPV_DECODE_SOFTWARE ? "software" : mpv_policy == MPV_DECODE_PI4_SAFE ? "pi4-safe" : "pi4-hevc-experimental",
+        mpv_trace_control_error(p.control_error), mpv_trace_label(p.failure_stage, "|startup|ipc|load|playback|control|stop|audio-output|video-output|"),
+        p.terminal_diagnostics_draining, (guint64)p.log_overflows, (guint64)p.event_overflows,
+        (guint64)p.log_text_rejected, (guint64)p.ipc_read_budget_exhaustions,
+        p.cache_video.reader_pts_known, p.cache_video.reader_pts, p.cache_video.cache_end_known, p.cache_video.cache_end,
+        p.cache_video.cache_duration_known, p.cache_video.cache_duration,
+        p.cache_audio.reader_pts_known, p.cache_audio.reader_pts, p.cache_audio.cache_end_known, p.cache_audio.cache_end,
+        p.cache_audio.cache_duration_known, p.cache_audio.cache_duration);
+    const size_t packet_used = strlen(text);
+    if (packet_used >= capacity) return;
+    g_snprintf(text + packet_used, capacity - packet_used,
+        " packet_capture_enabled=%d packet_capture_active=%d packet_capture_complete=%d"
+        " packet_capture_started_ms=%" G_GUINT64_FORMAT " packet_capture_ended_ms=%" G_GUINT64_FORMAT
+        " packet_log_rejected=%" G_GUINT64_FORMAT " packet_capture_errors=%" G_GUINT64_FORMAT
+        " video_packets=%" G_GUINT64_FORMAT " video_packet_bytes=%" G_GUINT64_FORMAT
+        " video_packets_with_pts=%" G_GUINT64_FORMAT " video_packet_first_pts=%.6f video_packet_last_pts=%.6f"
+        " video_packet_first_at_ms=%" G_GUINT64_FORMAT " video_packet_last_at_ms=%" G_GUINT64_FORMAT
+        " audio_packets=%" G_GUINT64_FORMAT " audio_packet_bytes=%" G_GUINT64_FORMAT
+        " audio_packets_with_pts=%" G_GUINT64_FORMAT " audio_packet_first_pts=%.6f audio_packet_last_pts=%.6f"
+        " audio_packet_first_at_ms=%" G_GUINT64_FORMAT " audio_packet_last_at_ms=%" G_GUINT64_FORMAT
+        " last_warning_stage=%s last_warning_reason=%s last_warning_at_ms=%" G_GUINT64_FORMAT
+        " packet_corrupt_warnings=%" G_GUINT64_FORMAT " pes_mismatch_warnings=%" G_GUINT64_FORMAT
+        " demux_read_warnings=%" G_GUINT64_FORMAT,
+        p.packet_diagnostics_enabled, p.packet_diagnostics_active, p.packet_diagnostics_complete,
+        (guint64)p.packet_capture_started_at_ms, (guint64)p.packet_capture_ended_at_ms,
+        (guint64)p.packet_log_rejected, (guint64)p.packet_capture_errors,
+        (guint64)p.packet_video.packets, (guint64)p.packet_video.bytes, (guint64)p.packet_video.pts_packets,
+        p.packet_video.first_pts, p.packet_video.last_pts,
+        (guint64)p.packet_video.first_at_ms, (guint64)p.packet_video.last_at_ms,
+        (guint64)p.packet_audio.packets, (guint64)p.packet_audio.bytes, (guint64)p.packet_audio.pts_packets,
+        p.packet_audio.first_pts, p.packet_audio.last_pts,
+        (guint64)p.packet_audio.first_at_ms, (guint64)p.packet_audio.last_at_ms,
+        mpv_trace_label(p.last_warning_stage, "|video-decode|audio-decode|video-output|audio-output|demux|source|unclassified|unknown|"),
+        mpv_trace_reason(p.last_warning_reason),
+        (guint64)p.last_warning_at_ms, (guint64)p.packet_corrupt_warnings,
+        (guint64)p.pes_mismatch_warnings, (guint64)p.demux_read_warnings);
+}
+
+static void trace_mpv_playback(const mpv_backend_snapshot_t &player, bool terminal_report = false) {
+    static uint64_t generation = 0;
+    static mpv_backend_state_t state = MPV_BACKEND_IDLE;
+    static mpv_backend_error_t error = MPV_BACKEND_ERROR_NONE;
+    static bool child_alive = false, exit_known = false;
+    static gint64 last_log_at = 0;
+    const gint64 now = g_get_monotonic_time();
+    bool changed = generation != player.generation || state != player.state ||
+        error != player.error_code || child_alive != player.child_alive || exit_known != player.child_exit_known;
+    if (!terminal_report && !changed && (!player.child_alive || screen_info != SCREEN_INFO_DEBUG ||
+        now - last_log_at < 2 * G_USEC_PER_SEC)) return;
+    char text[6144];
+    format_mpv_trace(player, text, sizeof(text), terminal_report);
+    trace_playback_record("%s", text);
+    if (terminal_report) return;
+    generation = player.generation;
+    state = player.state;
+    error = player.error_code;
+    child_alive = player.child_alive;
+    exit_known = player.child_exit_known;
+    last_log_at = now;
+}
+
+static void drain_mpv_terminal_reports() {
+    mpv_backend_snapshot_t terminal;
+    while (mpv_backend_take_terminal_snapshot(mpv_player, &terminal))
+        trace_mpv_playback(terminal, true);
+}
+
+static screen_status_error_t mpv_screen_error(const mpv_backend_snapshot_t &player) {
+    if (strstr(player.error, "timed out")) return SCREEN_ERROR_TIMEOUT;
+    switch (player.error_code) {
+    case MPV_BACKEND_ERROR_LOAD:
+    case MPV_BACKEND_ERROR_NO_MEDIA:
+    case MPV_BACKEND_ERROR_FORMAT: return SCREEN_ERROR_SOURCE;
+    case MPV_BACKEND_ERROR_AUDIO_OUTPUT:
+    case MPV_BACKEND_ERROR_VIDEO_OUTPUT: return SCREEN_ERROR_OUTPUT;
+    default: return SCREEN_ERROR_BACKEND;
+    }
+}
+#endif
+
+static gboolean receiver_screen_tick(gpointer unused) {
+    std::lock_guard<std::mutex> guard(display_mutex);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        if (mpv_owns_output && !mpv_output_prepared && !mpv_rebuild_pending) {
+            const gint64 release_started = g_get_monotonic_time();
+            trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=output-release-begin monotonic_ms=%" G_GINT64_FORMAT,
+                 (guint64)mpv_generation, (gint64)(release_started/1000));
+            if (!hide_status_display() || !video_renderer_suspend_output()) {
+                trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=output-release-failed monotonic_ms=%" G_GINT64_FORMAT " elapsed_ms=%" G_GINT64_FORMAT,
+                     (guint64)mpv_generation, (gint64)(g_get_monotonic_time()/1000), (gint64)((g_get_monotonic_time()-release_started)/1000));
+                screen_status_event(screen_generation(), SCREEN_EVENT_RECOVERY_REQUIRED);
+                mpv_backend_stop(mpv_player, mpv_generation);
+                /* Do not spawn the queued player if an output still owns DRM. */
+                return TRUE;
+            }
+            if (use_audio) audio_renderer_stop();
+            trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=output-release-complete monotonic_ms=%" G_GINT64_FORMAT " elapsed_ms=%" G_GINT64_FORMAT,
+                 (guint64)mpv_generation, (gint64)(g_get_monotonic_time()/1000), (gint64)((g_get_monotonic_time()-release_started)/1000));
+            mpv_output_prepared = true;
+            playback_output_released = false;
+        }
+        mpv_backend_poll(mpv_player);
+        drain_mpv_terminal_reports();
+        mpv_backend_snapshot_t player;
+        mpv_backend_snapshot(mpv_player, &player);
+        /* Replacement can change the requested generation before the old
+         * child exits. Persist that child's final evidence under its own ID. */
+        if (player.generation) trace_mpv_playback(player);
+        if (mpv_owns_output && player.generation == mpv_generation && !mpv_rebuild_pending) {
+            const uint64_t generation = player.generation;
+            screen_status_video_t video = {};
+            g_strlcpy(video.backend, "mpv", sizeof(video.backend));
+            g_strlcpy(video.codec, player.video_codec, sizeof(video.codec));
+            g_strlcpy(video.decoder, player.video_decoder, sizeof(video.decoder));
+            g_strlcpy(video.profile, player.video_profile, sizeof(video.profile));
+            g_strlcpy(video.pixel_format, player.pixel_format, sizeof(video.pixel_format));
+            /* Pixel format is not evidence of the decoder memory path. */
+            const char *policy = mpv_policy == MPV_DECODE_SOFTWARE ? "software" :
+                mpv_policy == MPV_DECODE_PI4_SAFE ? "pi4-safe" : "pi4-hevc-experimental";
+            g_strlcpy(video.decode_policy, policy, sizeof(video.decode_policy));
+            video.width = player.width > 0 ? player.width : 0;
+            video.height = player.height > 0 ? player.height : 0;
+            if (std::isfinite(player.fps) && player.fps > 0 && player.fps <= 1000) {
+                video.fps_num = (unsigned)(player.fps * 1000); video.fps_den = 1000;
+            }
+            video.hardware_known = player.hwdec_current[0] != 0;
+            video.hardware_active = video.hardware_known && strcmp(player.hwdec_current, "no") != 0;
+            video.decoded_parameters_known = player.decoded_parameters_known;
+            video.overlay_known = player.ready;
+            video.overlay_supported = player.ready && strcmp(player.video_output, "null") != 0;
+            video.dropped_known = player.dropped_frames >= 0;
+            video.dropped_frames = video.dropped_known ? player.dropped_frames : 0;
+            video.output_dropped_known = player.output_dropped_frames >= 0;
+            video.output_dropped_frames = video.output_dropped_known ? player.output_dropped_frames : 0;
+            screen_status_set_video(generation, &video);
+            screen_status_snapshot_t previous;
+            screen_status_get_snapshot(&previous);
+            screen_status_audio_t audio = previous.audio;
+            g_strlcpy(audio.codec, player.audio_codec, sizeof(audio.codec));
+            g_strlcpy(audio.output, player.audio_output, sizeof(audio.output));
+            audio.channels = player.audio_channels > 0 ? player.audio_channels : 0;
+            audio.sample_rate = player.audio_samplerate > 0 ? player.audio_samplerate : 0;
+            screen_status_set_audio(generation, &audio);
+            screen_status_progress_t progress = {};
+            progress.position_known = player.position_known;
+            progress.position_seconds = player.position;
+            progress.duration_known = player.duration_known;
+            progress.duration_seconds = player.duration;
+            progress.buffer_known = player.cache_buffering_known;
+            progress.buffer_percent = player.cache_buffering_known ? (int)player.cache_buffering_percent : -1;
+            progress.cache_seconds_known = player.cache_duration_known;
+            progress.cache_seconds = player.cache_duration;
+            progress.audio_position_known = player.audio_position_known;
+            progress.audio_position = player.audio_position;
+            progress.avsync_known = player.avsync_known;
+            progress.avsync = player.avsync;
+            progress.actual_paused_known = player.actual_paused_known;
+            progress.actual_paused = player.actual_paused;
+            progress.core_idle_known = player.core_idle_known;
+            progress.core_idle = player.core_idle;
+            progress.cache_eof_known = player.cache_eof_known;
+            progress.cache_eof = player.cache_eof;
+            progress.cache_underrun_known = player.cache_underrun_known;
+            progress.cache_underrun = player.cache_underrun;
+            progress.cache_idle_known = player.cache_idle_known;
+            progress.cache_idle = player.cache_idle;
+            progress.diagnostics_known = player.log_messages_active;
+            g_strlcpy(progress.diagnostic_stage, player.diagnostic_stage, sizeof(progress.diagnostic_stage));
+            progress.video_decode_errors = player.video_decode_errors;
+            progress.audio_decode_errors = player.audio_decode_errors;
+            progress.demux_errors = player.demux_errors;
+            progress.network_errors = player.network_errors;
+            progress.video_output_errors = player.video_output_errors;
+            progress.audio_output_errors = player.audio_output_errors;
+            progress.unclassified_errors = player.unclassified_errors;
+            progress.log_warnings = player.log_warnings;
+            progress.video_decode_warnings = player.video_decode_warnings;
+            progress.missing_reference_warnings = player.missing_reference_warnings;
+            progress.invalid_data_warnings = player.invalid_data_warnings;
+            progress.timestamp_warnings = player.timestamp_warnings;
+            progress.audio_output_warnings = player.audio_output_warnings;
+            progress.unknown_warnings = player.unknown_warnings;
+            progress.last_http_status_known = player.last_http_status_known;
+            progress.last_http_status = player.last_http_status;
+            g_strlcpy(progress.diagnostic_reason, player.diagnostic_reason, sizeof(progress.diagnostic_reason));
+            g_strlcpy(progress.last_warning_stage, player.last_warning_stage, sizeof(progress.last_warning_stage));
+            g_strlcpy(progress.last_warning_reason, player.last_warning_reason, sizeof(progress.last_warning_reason));
+            progress.packet_capture_enabled = player.packet_diagnostics_enabled;
+            progress.packet_capture_active = player.packet_diagnostics_active;
+            progress.packet_capture_complete = player.packet_diagnostics_complete;
+            progress.video_packets = player.packet_video.packets;
+            progress.audio_packets = player.packet_audio.packets;
+            screen_status_set_progress(generation, &progress);
+            static mpv_progress_observer_t observed_progress;
+            const gint64 now = g_get_monotonic_time();
+            const bool progressed = observe_mpv_progress(observed_progress, player, now);
+            if (previous.pause_requested && !player.requested_paused &&
+                player.actual_paused_known && !player.actual_paused)
+                screen_status_event(generation, SCREEN_EVENT_RESUMED);
+            if (previous.state == SCREEN_STATE_SEEKING && !player.seeking)
+                screen_status_event(generation, SCREEN_EVENT_SEEK_COMPLETE);
+            switch (player.state) {
+            case MPV_BACKEND_STARTING: case MPV_BACKEND_LOADING:
+                screen_status_event(generation, SCREEN_EVENT_OPENING); break;
+            case MPV_BACKEND_BUFFERING:
+                screen_status_event(generation, SCREEN_EVENT_BUFFERING); break;
+            case MPV_BACKEND_PAUSED:
+                screen_status_event(generation, SCREEN_EVENT_PAUSED); break;
+            case MPV_BACKEND_PLAYING: {
+                if (player.actual_paused_known && player.actual_paused)
+                    screen_status_event(generation, SCREEN_EVENT_PAUSED);
+                else if (progressed)
+                    screen_status_event(generation, SCREEN_EVENT_OUTPUT_PROGRESS);
+                else if (!player.requested_paused &&
+                         !(player.actual_paused_known && player.actual_paused) &&
+                         now - (observed_progress.advanced_at ? observed_progress.advanced_at :
+                                observed_progress.started_at) > 3 * G_USEC_PER_SEC)
+                    screen_status_event(generation, SCREEN_EVENT_WAITING_DATA);
+                break;
+            }
+            case MPV_BACKEND_STOPPING:
+                screen_status_event(generation, SCREEN_EVENT_STOPPING); break;
+            case MPV_BACKEND_FAILED:
+                if (player.recovery_required) screen_status_event(generation, SCREEN_EVENT_RECOVERY_REQUIRED);
+                else {
+                    char detail[160];
+                    if (player.file_error_code_known)
+                        g_snprintf(detail, sizeof(detail), "%s - %s (mpv error %d)",
+                                   player.error, player.file_error, player.file_error_code);
+                    else g_strlcpy(detail, player.error, sizeof(detail));
+                    screen_status_fail_detail(generation, mpv_screen_error(player), detail);
+                }
+                break;
+            default: break;
+            }
+            /* Stop/error/EOF can only return ownership after waitpid confirms
+             * exit. A fresh mirror shell is constructed by the existing loop. */
+            if (!player.child_alive && (player.state == MPV_BACKEND_ENDED || player.state == MPV_BACKEND_FAILED || player.state == MPV_BACKEND_IDLE)) {
+                mpv_rebuild_pending = true;
+                close_window = true;
+                preserve_connections = true;
+                full_video_reset = true;
+                relaunch_video = true;
+                reset_loop = true;
+            }
+            static gint64 last_osd = 0;
+            if (screen_info != SCREEN_INFO_OFF && player.child_alive &&
+                g_get_monotonic_time() - last_osd >= 500000) {
+                last_osd = g_get_monotonic_time();
+                screen_status_snapshot_t snapshot;
+                char text[2048];
+                screen_status_get_snapshot(&snapshot);
+                screen_status_format(&snapshot, text, sizeof(text), true);
+                mpv_backend_set_osd(mpv_player, generation, text);
+            }
+        }
+    }
+#endif
+    static gint64 last_refresh = 0;
+    gint64 now = g_get_monotonic_time();
+    if (now - last_refresh >= G_USEC_PER_SEC) {
+        screen_status_set_readiness(receiver_has_network(), raop && raop_is_running(raop),
+                                    receiver_registered, true, playback_output_released);
+        screen_status_snapshot_t current;
+        screen_status_get_snapshot(&current);
+        if (use_audio && !mpv_owns_output && current.session_active &&
+            (current.kind == SCREEN_SESSION_AUDIO_ONLY || current.kind == SCREEN_SESSION_MIRRORING)) {
+            screen_status_audio_t observed = {};
+            if (audio_renderer_get_screen_snapshot(&observed)) {
+                bool progressed = observed.output_buffers > current.audio.output_buffers;
+                screen_status_set_audio(current.generation, &observed);
+                if (progressed && current.kind == SCREEN_SESSION_AUDIO_ONLY)
+                    screen_status_event(current.generation, SCREEN_EVENT_OUTPUT_PROGRESS);
+            }
+        }
+        if (!mpv_owns_output && use_video) video_renderer_screen_refresh();
+        screen_status_get_snapshot(&current);
+        if (!mpv_owns_output && use_video && current.state == SCREEN_STATE_FAILED && !playback_output_released) {
+            close_window = true;
+            preserve_connections = true;
+            full_video_reset = true;
+            relaunch_video = true;
+            reset_loop = true;
+            url.clear();
+        }
+        if (status_display) screen_status_renderer_tick(status_display);
+        last_refresh = now;
+    }
+    return TRUE;
+}
+
 static gboolean video_eos_watch_callback (gpointer loop) {
     if (video_renderer_eos_watch()) {
         /* HLS video has sent EOS */
@@ -717,6 +1296,8 @@ static void main_loop()  {
     }
 
     missed_feedback = 0;
+    guint screen_watch_id = (screen_info != SCREEN_INFO_OFF || airplay_video_mpv) ?
+        g_timeout_add(25, receiver_screen_tick, NULL) : 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
 
@@ -754,6 +1335,7 @@ static void main_loop()  {
     if (progress_id > 0) g_source_remove(progress_id);
     if (video_eos_watch_id > 0) g_source_remove(video_eos_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+    if (screen_watch_id) g_source_remove(screen_watch_id);
     g_main_loop_unref(loop);
 }    
 
@@ -916,7 +1498,15 @@ static void print_info (char *name) {
     printf("-h265     Support h265 (4K) video (with h265 versions of h264 plugins)\n");
     printf("-mp4 [fn] Record (non-HLS)audio/video to mp4 file \"fn.[n].[format].mp4\"\n");
     printf("          n=1,2,.. format = H264/5, ALAC/AAC. Default fn=\"recording\"\n");
-    printf("-hls [v]  Support HTTP Live Streaming (HLS), Youtube app video only: \n");
+    printf("-airplay-video-backend gstreamer|mpv  Direct video player (default gstreamer)\n");
+    printf("-screen-info off|status|debug  HDMI receiver status (default off)\n");
+    printf("-mpv-decode software|pi4-safe|pi4-hevc-experimental  Default software\n");
+    printf("-mpv-executable path  Optional mpv executable (build with UXPLAY_ENABLE_MPV)\n");
+    printf("-mpv-vo name; -mpv-gpu-context name; -mpv-gpu-api name\n");
+    printf("-mpv-drm-device path; -mpv-drm-connector name; -mpv-audio-device name\n");
+    printf("-mpv-h264-hwdec name  Explicitly qualified Pi 4 H.264 hwdec for pi4-safe\n");
+    printf("-mpv-render-profile default|fast  mpv rendering quality/cost (default default)\n");
+    printf("-hls [v]  Support direct AirPlay video (HTTP/HLS): \n");
     printf("          v = 2 or 3 (default 3) optionally selects video player version\n");
     printf("-hls-pi4  Enable HLS; limit cached YouTube video to H.264/AAC-LC,\n");
     printf("          up to 1920x1080 at 60 fps; select vc4 for kmssink unless\n");
@@ -1722,6 +2312,49 @@ static void parse_arguments (int argc, char *argv[]) {
                 exit(1);
             }
             i++;
+        } else if (arg == "-airplay-video-backend" || arg == "-screen-info" || arg.compare(0, 5, "-mpv-") == 0) {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "%s requires a value\n", arg.c_str()); exit(1);
+            }
+            std::string value = argv[++i];
+            if (arg == "-screen-info") {
+                if (!screen_status_parse_mode(value.c_str(), &screen_info)) {
+                    fprintf(stderr, "screen-info must be off, status or debug\n"); exit(1);
+                }
+            } else if (arg == "-airplay-video-backend") {
+                if (value != "mpv" && value != "gstreamer") {
+                    fprintf(stderr, "airplay-video-backend must be gstreamer or mpv\n"); exit(1);
+                }
+                airplay_video_mpv = value == "mpv";
+#ifndef UXPLAY_HAVE_MPV
+                if (airplay_video_mpv) { fprintf(stderr, "mpv backend not built; configure with -DUXPLAY_ENABLE_MPV=ON\n"); exit(1); }
+#endif
+                hls_support = true;
+            } else {
+#ifdef UXPLAY_HAVE_MPV
+                if (arg == "-mpv-decode") {
+                    if (value == "software") mpv_policy = MPV_DECODE_SOFTWARE;
+                    else if (value == "pi4-safe") mpv_policy = MPV_DECODE_PI4_SAFE;
+                    else if (value == "pi4-hevc-experimental") mpv_policy = MPV_DECODE_PI4_HEVC_EXPERIMENTAL;
+                    else { fprintf(stderr, "invalid mpv-decode policy\n"); exit(1); }
+                } else if (arg == "-mpv-render-profile") {
+                    if (value != "default" && value != "fast") {
+                        fprintf(stderr, "mpv-render-profile must be default or fast\n"); exit(1);
+                    }
+                    mpv_fast_rendering = value == "fast";
+                } else if (arg == "-mpv-executable") mpv_executable = value;
+                else if (arg == "-mpv-vo") mpv_vo = value;
+                else if (arg == "-mpv-gpu-context") mpv_context = value;
+                else if (arg == "-mpv-gpu-api") mpv_api = value;
+                else if (arg == "-mpv-drm-device") mpv_drm_device = value;
+                else if (arg == "-mpv-drm-connector") mpv_connector = value;
+                else if (arg == "-mpv-audio-device") mpv_audio_device = value;
+                else if (arg == "-mpv-h264-hwdec") mpv_h264_hwdec = value;
+                else { fprintf(stderr, "unknown mpv option %s\n", arg.c_str()); exit(1); }
+#else
+                fprintf(stderr, "mpv options require -DUXPLAY_ENABLE_MPV=ON\n"); exit(1);
+#endif
+            }
         } else if (arg == "-hls") {
             hls_support = true;
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -2124,6 +2757,22 @@ static bool check_blocked_client(char *deviceid) {
 //to be simplified
 
 extern "C" void video_reset(void *cls, reset_type_t type) {
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player && mpv_owns_output) {
+        if (type == RESET_TYPE_RTP_TO_HLS_TEARDOWN || type == RESET_TYPE_RTP_SHUTDOWN) return;
+        /* Callback only requests stop. The loop releases/reaps before it
+         * rebuilds GStreamer or presents the idle screen. */
+        screen_status_event(screen_generation(), SCREEN_EVENT_STOPPING);
+        mpv_backend_stop(mpv_player, mpv_generation);
+        return;
+    }
+#endif
+    if (type != RESET_TYPE_ON_VIDEO_PLAY) {
+        screen_status_event(screen_generation(), SCREEN_EVENT_STOPPING);
+    }
+    std::lock_guard<std::mutex> guard(display_mutex);
+    if (mpv_owns_output) return; /* A replacement won the lock after the check above. */
+    if (!hide_status_display()) return;
     switch (type) {
     case RESET_TYPE_NOHOLD:
         LOGD("video_reset: type = NoHold");
@@ -2180,6 +2829,8 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         g_assert(FALSE);
         break;
     }
+    if ((screen_info != SCREEN_INFO_OFF || airplay_video_mpv) && type != RESET_TYPE_ON_VIDEO_PLAY)
+        full_video_reset = true; /* The idle presenter also needs the post-loop release path. */
     reset_loop = true;
 }
 
@@ -2191,7 +2842,22 @@ extern "C" int video_set_codec(void *cls, video_codec_t codec) {
     if (!use_video) {
         return 0;
     }
-    return video_renderer_choose_codec(false, video_is_h265);
+    if (!wait_for_mpv_release()) return -1;
+    std::lock_guard<std::mutex> guard(display_mutex);
+    if (mpv_owns_output) return -1; /* A newer direct request won the handover. */
+    if (!hide_status_display()) return -1;
+    screen_status_snapshot_t current;
+    screen_status_get_snapshot(&current);
+    if (current.kind != SCREEN_SESSION_MIRRORING || !current.session_active) {
+        screen_status_begin_session(SCREEN_SESSION_MIRRORING, SCREEN_ROUTE_RTP, "AirPlay");
+        screen_set_backend(false);
+    }
+    screen_status_event(screen_generation(), SCREEN_EVENT_OPENING);
+    playback_output_released = false;
+    playback_generation = screen_generation();
+    int result = video_renderer_choose_codec(false, video_is_h265);
+    if (result) screen_status_fail(screen_generation(), SCREEN_ERROR_DECODER);
+    return result;
 }
 
 extern "C" void display_pin(void *cls, char *pin) {
@@ -2241,6 +2907,10 @@ extern "C" void conn_destroy (void *cls) {
     open_connections--;
     LOGD("Open connections: %i", open_connections);
     if (open_connections == 0) {
+        screen_status_snapshot_t screen;
+        screen_status_get_snapshot(&screen);
+        if (screen.kind == SCREEN_SESSION_AUDIO_ONLY)
+            screen_status_event(screen.generation, SCREEN_EVENT_STOPPED);
         remote_clock_offset = 0;
         if (use_audio) {
             audio_renderer_stop();
@@ -2301,6 +2971,7 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
 }
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+    if (mpv_owns_output) return;
     if (dump_audio) {
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
     }
@@ -2336,6 +3007,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 }
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
+    if (mpv_owns_output) return;
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
     }
@@ -2343,6 +3015,8 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
         mux_renderer_push_video(data->data, data->data_len, data->ntp_time_remote);
     }
     if (use_video) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        if (mpv_owns_output) return;
         if (!remote_clock_offset) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
             remote_clock_offset = local_time - data->ntp_time_remote;
@@ -2443,9 +3117,32 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     }
     audio_renderer_set_volume(gst_volume);
     video_renderer_hls_set_volume(gst_volume);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        mpv_backend_snapshot_t player;
+        mpv_backend_snapshot(mpv_player, &player);
+        mpv_backend_set_volume(mpv_player, player.generation, std::min(100.0, gst_volume * 100), volume == -144.0f);
+    }
+#endif
+    screen_status_snapshot_t snapshot;
+    screen_status_get_snapshot(&snapshot);
+    snapshot.audio.volume_known = true;
+    snapshot.audio.volume = gst_volume;
+    snapshot.audio.muted = volume == -144.0f;
+    screen_status_set_audio(snapshot.generation, &snapshot.audio);
 }
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
+    if (!wait_for_mpv_release()) return;
+    std::lock_guard<std::mutex> guard(display_mutex);
+    if (mpv_owns_output) return;
+    screen_status_snapshot_t screen;
+    screen_status_get_snapshot(&screen);
+    if (!*usingScreen && (screen.kind != SCREEN_SESSION_AUDIO_ONLY || !screen.session_active)) {
+        screen_status_begin_session(SCREEN_SESSION_AUDIO_ONLY, SCREEN_ROUTE_RTP, "AirPlay");
+        screen_set_backend(false);
+        screen_status_event(screen_generation(), SCREEN_EVENT_WAITING_DATA);
+    }
     unsigned char type;
     LOGI("RAOP audio: stage=setup ct=%d spf=%d usingScreen=%d isMedia=%d audioFormat=0x%lx",
          *ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
@@ -2492,7 +3189,11 @@ extern "C" void audio_set_coverart(void *cls, const void *buffer, int buflen) {
     if (buffer && coverart_filename.length()) {
         write_coverart(coverart_filename.c_str(), buffer, buflen);
         LOGI("coverart size %d written to %s", buflen,  coverart_filename.c_str());
-    } else if (buffer && render_coverart) {
+    } else if (buffer && render_coverart && !mpv_owns_output) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        if (mpv_owns_output) return;
+        if (!hide_status_display()) return;
+        playback_output_released = false;
         video_renderer_choose_codec(true, false);  /* video_is_jpeg = true */
         video_renderer_display_jpeg(buffer, &buflen);
         coverart_artist = "_pending_";
@@ -2597,7 +3298,52 @@ extern "C" bool check_register(void *cls, const char *client_pk) {
 }
 /* control  callbacks for video player (unimplemented) */
 
+extern "C" void on_video_request(void *cls, bool direct_http) {
+    const uint64_t generation = screen_status_begin_session(SCREEN_SESSION_DIRECT_VIDEO,
+        direct_http ? SCREEN_ROUTE_DIRECT_HTTP : SCREEN_ROUTE_PLAYLIST_CACHE, "AirPlay");
+    screen_set_backend(true);
+    screen_status_event(generation, SCREEN_EVENT_PREPARING);
+    trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=request route=%s monotonic_ms=%" G_GINT64_FORMAT,
+         (guint64)generation, direct_http ? "direct-http" : "playlist-cache", (gint64)(g_get_monotonic_time()/1000));
+}
+
+extern "C" void on_video_request_error(void *cls) {
+    const uint64_t generation = screen_generation();
+    trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=source-failed monotonic_ms=%" G_GINT64_FORMAT,
+         (guint64)generation, (gint64)(g_get_monotonic_time()/1000));
+    screen_status_fail(generation, SCREEN_ERROR_SOURCE);
+#ifdef UXPLAY_HAVE_MPV
+    const uint64_t player_generation = mpv_generation;
+    if (mpv_player && mpv_owns_output) mpv_backend_stop(mpv_player, player_generation);
+#endif
+}
+
 extern "C" void on_video_play(void *cls, const char* location, const float start_position, bool direct_http) {
+    screen_status_snapshot_t current;
+    screen_status_get_snapshot(&current);
+    if (!current.session_active || current.kind != SCREEN_SESSION_DIRECT_VIDEO ||
+        (current.state != SCREEN_STATE_PREPARING && current.state != SCREEN_STATE_INCOMING)) {
+        on_video_request(cls, direct_http);
+    }
+    screen_status_event(screen_generation(), SCREEN_EVENT_OPENING);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        const uint64_t generation = screen_generation();
+        if (!mpv_backend_open(mpv_player, generation, location, start_position)) {
+            trace_playback_record("MPV playback: session=%" G_GUINT64_FORMAT " request=rejected", (guint64)generation);
+            screen_status_fail(generation, SCREEN_ERROR_SOURCE);
+            if (mpv_owns_output) mpv_backend_stop(mpv_player, mpv_generation);
+            return;
+        }
+        mpv_rebuild_pending = false;
+        mpv_generation = generation;
+        mpv_owns_output = true;
+        trace_playback_record("MPV playback: session=%" G_GUINT64_FORMAT " request=queued route=%s start=%.3f",
+             (guint64)generation, direct_http ? "direct-http" : "playlist-cache", start_position);
+        return;
+    }
+#endif
     /* Register this request before rebuilding the renderer. */
     video_renderer_set_start_with_source(start_position, direct_http);
     url.erase();
@@ -2610,14 +3356,39 @@ extern "C" void on_video_play(void *cls, const char* location, const float start
 
 extern "C" void on_video_scrub(void *cls, const float position) {
     LOGI("on_video_scrub: position = %7.5f\n", position);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        const uint64_t generation = mpv_generation;
+        const bool accepted = mpv_backend_seek(mpv_player, generation, position);
+        trace_mpv_control(generation, "seek", accepted, position);
+        if (accepted)
+            screen_status_event(generation, SCREEN_EVENT_SEEKING);
+        return;
+    }
+#endif
     video_renderer_seek(position);
 }
 
 extern "C" void on_video_rate(void *cls, const float rate) {
     LOGI("on_video_rate = %7.5f\n", rate);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        const uint64_t generation = mpv_generation;
+        const bool accepted = rate == 1.0f ? mpv_backend_resume(mpv_player, generation) :
+            rate == 0.0f ? mpv_backend_pause(mpv_player, generation) : false;
+        trace_mpv_control(generation, rate == 1.0f ? "resume" : rate == 0.0f ? "pause" : "rate-ignored", accepted, rate);
+        if (rate == 1.0f && accepted)
+            screen_status_event(generation, SCREEN_EVENT_RESUMED);
+        if (rate == 0.0f && accepted)
+            screen_status_event(generation, SCREEN_EVENT_PAUSED);
+        return;
+    }
+#endif
     if (rate == 1.0f) {
+        screen_status_event(screen_generation(), SCREEN_EVENT_RESUMED);
         video_renderer_resume();
     } else if (rate ==  0.0f) {
+        screen_status_event(screen_generation(), SCREEN_EVENT_PAUSED);
         video_renderer_pause();
     } else  {
         LOGI("on_video_rate: ignoring unexpected value rate = %f\n", rate);
@@ -2627,6 +3398,16 @@ extern "C" void on_video_rate(void *cls, const float rate) {
 
 
 extern "C" float on_video_playlist_remove (void *cls) {
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        mpv_backend_snapshot_t snapshot;
+        const uint64_t generation = mpv_generation;
+        const bool accepted = mpv_backend_pause(mpv_player, generation);
+        trace_mpv_control(generation, "playlist-pause", accepted, 0);
+        mpv_backend_snapshot(mpv_player, &snapshot);
+        return snapshot.generation == generation && snapshot.position_known ? (float)snapshot.position : 0.0f;
+    }
+#endif
     double duration, position, seek_start, seek_end;
     float rate;
     bool buffer_empty, buffer_full;
@@ -2637,11 +3418,58 @@ extern "C" float on_video_playlist_remove (void *cls) {
 }
 
  extern "C" void on_video_stop(void *cls) {
-    LOGI("**************************on_video_stop\n");
-    video_renderer_hls_ready();
+    LOGI("Direct playback: stop requested");
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        std::lock_guard<std::mutex> guard(display_mutex);
+        const uint64_t generation = mpv_generation;
+        const uint64_t request_generation = screen_generation();
+        screen_status_event(request_generation, SCREEN_EVENT_STOPPING);
+        const bool accepted = mpv_backend_stop(mpv_player, generation);
+        trace_mpv_control(generation, "stop", accepted, 0);
+        /* A /stop can cancel a request before its URL reaches the adapter.
+         * There is then no child/rebuild event to finish that screen request. */
+        if (!mpv_owns_output) {
+            screen_status_event(request_generation, SCREEN_EVENT_STOPPED);
+            trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=stopped monotonic_ms=%" G_GINT64_FORMAT,
+                 (guint64)request_generation, (gint64)(g_get_monotonic_time()/1000));
+        }
+        return;
+    }
+#endif
+    screen_status_event(screen_generation(), SCREEN_EVENT_STOPPING);
+    video_reset(cls, RESET_TYPE_HLS_SHUTDOWN);
  }
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        mpv_backend_snapshot_t snapshot;
+        mpv_backend_snapshot(mpv_player, &snapshot);
+        memset(playback_info, 0, sizeof(*playback_info));
+        if (snapshot.generation != mpv_generation || snapshot.generation != screen_generation()) {
+            playback_info->rate = 1.0f;
+            playback_info->playback_buffer_empty = true;
+            return;
+        }
+        bool terminal = snapshot.state == MPV_BACKEND_ENDED || snapshot.state == MPV_BACKEND_FAILED ||
+            (snapshot.state == MPV_BACKEND_IDLE && !mpv_owns_output);
+        playback_info->duration = terminal ? -1.0 : snapshot.duration_known ? snapshot.duration : 0.0;
+        playback_info->position = terminal ? -1.0 : snapshot.position_known ? snapshot.position : 0.0;
+        playback_info->rate = snapshot.requested_paused ? 0.0f : 1.0f;
+        playback_info->ready_to_play = snapshot.ready && !terminal;
+        playback_info->playback_buffer_empty = snapshot.buffering;
+        playback_info->playback_buffer_full = snapshot.ready && !snapshot.buffering && !terminal;
+        playback_info->playback_likely_to_keep_up = playback_info->playback_buffer_full;
+        if (snapshot.seekable_known && snapshot.seekable) {
+            if (snapshot.cache_range_known) {
+                playback_info->seek_start = snapshot.cache_start;
+                playback_info->seek_duration = std::max(0.0, snapshot.cache_end - snapshot.cache_start);
+            } else if (snapshot.duration_known) playback_info->seek_duration = snapshot.duration;
+        }
+        return;
+    }
+#endif
     int buffering_level;
     bool still_playing = video_get_playback_info_with_readiness(&playback_info->duration, &playback_info->position,
                                                  &playback_info->seek_start, &playback_info->seek_duration,
@@ -2723,6 +3551,8 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
 #ifdef DBUS
     raop_cbs.mirror_video_running = mirror_video_running;
 #endif
+    raop_cbs.on_video_request = on_video_request;
+    raop_cbs.on_video_request_error = on_video_request_error;
     raop_cbs.on_video_play = on_video_play;
     raop_cbs.on_video_scrub = on_video_scrub;
     raop_cbs.on_video_rate = on_video_rate;
@@ -2757,6 +3587,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     if (audiodelay >= 0) raop_set_plist(raop, "audio_delay_micros", audiodelay);
     if (pin_pw == 1) raop_set_plist(raop, "pin", (int) pin);
     if (hls_support) raop_set_plist(raop, "hls", 1);
+    if (airplay_video_mpv) raop_set_plist(raop, "hls_scoped_cache", 1);
     if (hls_pi4) {
         raop_set_plist(raop, "hls_pi4", 1);
         LOGI("Cached YouTube HLS profile: Raspberry Pi 4, H.264/AAC-LC up to 1080p60");
@@ -2767,7 +3598,10 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_set_udp_ports(raop, udp);
 
     raop_port = raop_get_port(raop);
-    raop_start_httpd(raop, &raop_port);
+    if (raop_start_httpd(raop, &raop_port) < 0 || !raop_is_running(raop)) {
+        LOGE("AirPlay listener failed to start");
+        return -3;
+    }
     raop_set_port(raop, raop_port);
 
     /* use raop_port for airplay_port (instead of tcp[2]) */
@@ -2872,6 +3706,64 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
         parse_arguments (argc, argv);
         free (argv);
     }
+}
+
+/* The only post-session rebuild path. Test harnesses exercise this same
+ * function, including the child-exit and display-release boundaries. */
+static bool rebuild_video_outputs() {
+    std::lock_guard<std::mutex> guard(display_mutex);
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player && mpv_owns_output) {
+        mpv_backend_snapshot_t player;
+        mpv_backend_snapshot(mpv_player, &player);
+        /* A replacement request may arrive after the loop decided to reset. */
+        if (!mpv_rebuild_pending) return true;
+        if (player.child_alive) return false;
+    }
+#endif
+    if (!hide_status_display()) return false;
+    uint64_t finished_generation = mpv_rebuild_pending ? (uint64_t)mpv_generation : (uint64_t)playback_generation;
+    screen_status_snapshot_t pending_screen;
+    screen_status_get_snapshot(&pending_screen);
+    if (pending_screen.state == SCREEN_STATE_STOPPING &&
+        pending_screen.generation >= finished_generation)
+        finished_generation = pending_screen.generation;
+    video_renderer_destroy();
+    if (!preserve_connections) {
+        url.erase();
+        if (raop) raop_remove_known_connections(raop);
+    }
+    const char *uri = url.empty() ? NULL : url.c_str();
+    playback_output_released = false;
+    playback_generation = uri ? screen_generation() : 0;
+    video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
+                        video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
+                        videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                        render_coverart, playbin_version, uri);
+    full_video_reset = false;
+    video_renderer_start();
+    bool suspended = false;
+    if (!uri && (status_display || airplay_video_mpv)) {
+        if (!video_renderer_suspend_output()) {
+            screen_status_event(screen_generation(), SCREEN_EVENT_RECOVERY_REQUIRED);
+            return false;
+        }
+        suspended = true;
+    }
+    if (mpv_rebuild_pending) {
+        mpv_rebuild_pending = false;
+        mpv_output_prepared = false;
+        mpv_owns_output = false;
+    }
+    if (!uri) {
+        playback_output_released = suspended;
+        screen_status_set_readiness(receiver_has_network(), raop && raop_is_running(raop), receiver_registered, true, suspended);
+        screen_status_event(finished_generation, SCREEN_EVENT_STOPPED);
+        if (!mirror_waiting) show_status_display();
+        trace_playback_record("Playback session: session=%" G_GUINT64_FORMAT " event=receiver-rebuilt monotonic_ms=%" G_GINT64_FORMAT,
+             (guint64)finished_generation, (gint64)(g_get_monotonic_time()/1000));
+    }
+    return true;
 }
 
 static void configure_stdout_buffering() {
@@ -3177,6 +4069,36 @@ int main (int argc, char *argv[]) {
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
 
+    screen_status_init(screen_info, server_name.c_str());
+    screen_set_backend(true);
+    video_renderer_configure_screen(screen_info);
+    if (screen_info != SCREEN_INFO_OFF && use_video)
+        status_display = screen_status_renderer_new(render_logger, videosink.c_str(), videosink_options.c_str());
+#ifdef UXPLAY_HAVE_MPV
+    if (airplay_video_mpv) {
+        if (!use_video) { LOGE("mpv AirPlay video requires video output enabled"); exit(1); }
+        mpv_config.executable = mpv_executable.empty() ? NULL : mpv_executable.c_str();
+        mpv_config.video_output = mpv_vo.empty() ? NULL : mpv_vo.c_str();
+        mpv_config.gpu_context = mpv_context.empty() ? NULL : mpv_context.c_str();
+        mpv_config.gpu_api = mpv_api.empty() ? NULL : mpv_api.c_str();
+        mpv_config.drm_device = mpv_drm_device.empty() ? NULL : mpv_drm_device.c_str();
+        mpv_config.drm_connector = mpv_connector.empty() ? NULL : mpv_connector.c_str();
+        mpv_config.audio_device = mpv_audio_device.empty() ? NULL : mpv_audio_device.c_str();
+        mpv_config.qualified_h264_hwdec = mpv_h264_hwdec.empty() ? NULL : mpv_h264_hwdec.c_str();
+        mpv_config.fast_rendering = mpv_fast_rendering;
+        mpv_config.decode_policy = mpv_policy;
+        mpv_config.disable_audio = !use_audio;
+        mpv_config.packet_diagnostics = screen_info == SCREEN_INFO_DEBUG;
+        char error[192];
+        if (!mpv_backend_preflight(&mpv_config, error, sizeof(error))) {
+            LOGE("mpv startup check failed: %s", error); exit(1);
+        }
+        mpv_player = mpv_backend_create(&mpv_config, error, sizeof(error));
+        if (!mpv_player) { LOGE("mpv setup failed: %s", error); exit(1); }
+        LOGI("AirPlay video backend: mpv (mirroring and RAOP audio: GStreamer)");
+    }
+#endif
+
     if (hls_pi4) {
         video_renderer_configure_pi4(render_logger);
     }
@@ -3192,6 +4114,13 @@ int main (int argc, char *argv[]) {
                             videosink_options.c_str(), fullscreen, video_sync, h265_support,
                             render_coverart, playbin_version, NULL);
         video_renderer_start();
+        if (status_display || airplay_video_mpv) {
+            if (!video_renderer_suspend_output()) {
+                screen_status_event(screen_generation(), SCREEN_EVENT_RECOVERY_REQUIRED);
+                LOGE("Initial GStreamer output release failed"); exit(1);
+            }
+            show_status_display();
+        }
 #ifdef __OpenBSD__
     } else {
         if (pledge("stdio rpath wpath cpath inet unix prot_exec", NULL) == -1) {
@@ -3274,6 +4203,10 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
         cleanup();
     }
+    receiver_registered = true;
+    playback_output_released = status_display || airplay_video_mpv || !use_video;
+    screen_status_set_readiness(receiver_has_network(), true, true, true, playback_output_released);
+    if (status_display) screen_status_renderer_tick(status_display);
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;
@@ -3286,19 +4219,10 @@ int main (int argc, char *argv[]) {
             LOGI("RAOP audio: stage=stop-request reason=video-relaunch direct_video=%d", !url.empty());
             audio_renderer_stop();
         }
-        if (use_video && (close_window || preserve_connections || full_video_reset)) {
-            video_renderer_destroy();
-            if (!preserve_connections) {
-                url.erase();
-                raop_remove_known_connections(raop);
-            }
-            const char *uri = (url.empty() ? NULL : url.c_str());
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
-                                render_coverart, playbin_version, uri);
-            full_video_reset = false;
-            video_renderer_start();
+        if (use_video && (close_window || preserve_connections || full_video_reset) && !rebuild_video_outputs()) {
+            stop_raop_server();
+            stop_dnssd();
+            cleanup();
         }
         if (reset_httpd) {
             unsigned short port = raop_get_port(raop);
@@ -3317,7 +4241,34 @@ int main (int argc, char *argv[]) {
     cleanup();
 }
  
-static void cleanup() {
+[[noreturn]] static void cleanup() {
+#ifdef UXPLAY_HAVE_MPV
+    if (mpv_player) {
+        mpv_backend_shutdown(mpv_player);
+        const gint64 deadline = g_get_monotonic_time() + 7 * G_USEC_PER_SEC;
+        drain_mpv_terminal_reports();
+        while (!mpv_backend_destroy(mpv_player)) {
+            mpv_backend_poll(mpv_player);
+            drain_mpv_terminal_reports();
+            mpv_backend_snapshot_t player;
+            mpv_backend_snapshot(mpv_player, &player);
+            trace_mpv_playback(player);
+            if (g_get_monotonic_time() >= deadline) {
+                LOGE("mpv did not exit; output recovery requires the service supervisor");
+                /* Preserve the output boundary: never start another player. */
+                exit(1);
+            }
+            g_usleep(10000);
+        }
+        mpv_player = NULL;
+    }
+#endif
+    if (status_display) {
+        if (!screen_status_renderer_free(status_display)) {
+            LOGE("Status display did not release output"); exit(1);
+        }
+        status_display = NULL;
+    }
     if (use_audio) {
         audio_renderer_destroy();
     }
