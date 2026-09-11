@@ -39,11 +39,15 @@ The IP above is an example, not discovery of your Pi. Use normal SSH host-key ve
 ## The iteration loop
 
 1. Edit locally with Codex.
-2. Run the deploy command from the Mac:
+2. For the current documented mpv receiver, run from the Mac:
 
 ```bash
-./scripts/pi-dev deploy
+./scripts/pi-dev deploy --with-mpv
 ```
+
+The `--with-mpv` flag is required when the receiver configuration selects mpv.
+Omitting it builds the default GStreamer-only receiver, even in a reused build
+folder. Use plain `deploy` only for that intentionally selected configuration.
 
 3. Select the receiver in UHF and test the change.
 4. Inspect recent service logs from the Mac:
@@ -57,8 +61,10 @@ The first build compiles the whole project. Later builds reuse the same CMake bu
 To compile without switching the receiver:
 
 ```bash
-./scripts/pi-dev build
+./scripts/pi-dev build --with-mpv
 ```
+
+For an intentional GStreamer-only build, omit `--with-mpv`.
 
 To return to the previous development release:
 
@@ -116,15 +122,15 @@ The tests cover buffering and user intent, safe time conversion, the production 
 
 YouTube cache tests also cover interrupted collection and complete-cache reuse. When Python 3 and FFmpeg are installed at configuration time, CTest adds an HTTP HLS test using generated H.264 video and a separate AAC audio playlist. It checks advancing playback from zero and from a 165-second resume point. A mixed H.264/VP9 master reproduces the GStreamer 1.26.2 demux failure; the test then runs the production Pi 4 playlist filter and verifies that both initial playback and resume advance. FFmpeg needs the libx264, libvpx-vp9 and AAC encoders. The test runtime needs GStreamer's HLS, MPEG-TS and codec plugins; the Dockerfile includes these dependencies. All media and HTTP serving stay local to the test environment.
 
-For the first playback iteration, deploy and test a 1080p stream followed by the problematic 4K stream. Collect `Direct playback:` entries using `./scripts/pi-dev logs`, together with the seconds from selecting the receiver to visible video. Also test pause/resume, seeking past 40 minutes in a series, stop/reconnect and channel changes. Current diagnostics observe first video-sink buffer arrival, not physical presentation; they do not yet distinguish manifest download from media-segment download.
+For the first playback iteration, deploy and test a 1080p stream followed by the problematic 4K stream. Collect `Direct playback:` entries using `./scripts/pi-dev logs`, together with the seconds from selecting the receiver to visible video. Also test pause/resume, seeking past 40 minutes in a series, stop/reconnect and channel changes. The original iteration observed first video-sink buffer arrival, not physical presentation. Later manifest/media and packet observations, and their remaining gaps, are documented below and in [the logging audit](playback-logging-audit.md).
 
 Once native incremental builds are measured, consider cross-compilation or CI if compilation is the bottleneck. A Mac build itself cannot validate Linux GStreamer/DRM behaviour. CMake supports reusable build directories through [its configure/build commands](https://cmake.org/cmake/help/latest/manual/cmake.1.html); [rsync](https://download.samba.org/pub/rsync/rsync.1) handles incremental transfer.
 
 ## Raspberry Pi 4 YouTube compatibility
 
-Add `hls-pi4` on its own line in the receiver configuration (or pass `-hls-pi4` on the command line) to enable HLS and keep cached YouTube video within the tested H.264/AAC-LC path. The profile retains available variants with declared H.264 and AAC-LC codecs, a positive resolution no larger than 1920×1080, and no declared frame rate above 60 fps. Adaptive quality selection remains available among compatible variants. If none qualify, playback is rejected with a diagnostic message.
+Add `hls-pi4` on its own line in the receiver configuration (or pass `-hls-pi4` on the command line) to enable HLS and keep cached YouTube video within the tested H.264/AAC-LC path. The profile retains available variants with declared H.264 and AAC-LC codecs, a positive resolution no larger than 1920×1080, and no declared frame rate above 60 fps. The GStreamer path retains adaptive quality selection among compatible variants. The later mpv path skips unsupported playlist downloads and exposes the highest-bandwidth available compatible variant with its required media groups; see [the startup follow-up](startup-switch-regression.md). If none qualify, playback is rejected with a diagnostic message.
 
-This selects from declared playlist metadata; it does not transcode media or guarantee that every H.264 profile/bit depth is hardware-decodable. Ordinary HTTP streams from UHF use their existing route. For `kmssink`, the profile also selects the Pi's `vc4` display driver, unless `driver-name`, `bus-id` or `fd` was explicitly configured. This avoids several seconds of generic driver discovery for each new sink. The profile also excludes `v4l2slh265dec` from automatic decoder selection in this receiver process. A real UHF stop wedged that Pi HEVC driver in an uninterruptible kernel wait and prevented later YouTube playback. HEVC uses `avdec_h265` when installed; H.264 hardware selection remains unchanged. Software HEVC performance, especially above 720p, still requires measurement. Removing `hls-pi4` restores the default playlist, decoder and display-driver choices. Keep the existing `hls` line if HLS should remain enabled after removing the profile.
+This selects from declared playlist metadata; it does not transcode media or guarantee that every H.264 profile/bit depth is hardware-decodable. Ordinary HTTP streams from UHF use their existing route. The following decoder/display behavior belongs to the GStreamer path; mpv uses its [separate decode policy](mpv-screen-development.md#pi-4-decoding). For `kmssink`, the profile also selects the Pi's `vc4` display driver, unless `driver-name`, `bus-id` or `fd` was explicitly configured. This avoids several seconds of generic driver discovery for each new sink. The profile also excludes `v4l2slh265dec` from automatic decoder selection in this receiver process. A real UHF stop wedged that Pi HEVC driver in an uninterruptible kernel wait and prevented later YouTube playback. HEVC uses `avdec_h265` when installed; H.264 hardware selection remains unchanged. Software HEVC performance, especially above 720p, still requires measurement. Removing `hls-pi4` restores the default playlist, decoder and display-driver choices. Keep the existing `hls` line if HLS should remain enabled after removing the profile.
 
 ## UHF stream-loading diagnostics
 

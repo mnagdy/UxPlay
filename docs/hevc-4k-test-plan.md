@@ -1,14 +1,17 @@
 # Raspberry Pi 4 HEVC / 4K qualification
 
-Prepared 10 September 2026. These tests isolate the decoder, display and media
-container from UHF. They do not enable HEVC hardware decoding in the receiver.
+Prepared 10 September 2026. These standalone tests isolate the decoder, display
+and media container from UHF and do not change receiver configuration. A later
+[receiver trial](hevc-airplay-trial.md) integrated the successful primary-plane
+arrangement. [Current recorded status](../FORK.md) distinguishes that integration
+from the still-failing UHF sources.
 
 ## Measured results, 10 September
 
 At the existing 720p60 HDMI mode, direct DRM hardware decoding through `gpu`
 completed the six 720p Main/Main 10 start/stop trials. The viewer confirmed
 picture and sound. Both 4K30 Main and Main 10 then completed with zero recorded
-decoder or display drops. The 4K tests have not yet received visual confirmation.
+decoder or display drops. These initial 4K30 GPU checks had automated evidence only; later visual acceptance is recorded below.
 
 | Input / path | Measured display drops after warm-up | Result |
 |---|---:|---|
@@ -25,7 +28,7 @@ The revised `overlay-primary` path passed six Main/Main 10 smoke cycles
 (`20260910T214912-0b1330.json`, `20260910T214952-fd021e.json`). The 4K60 tests
 recorded zero output and decoder drops, zero atomic commit failures and no
 steady-playback clock stalls. Hardware decoding was observed, each process
-quit normally, and the receiver was restored. Visual confirmation is pending.
+quit normally, and the receiver was restored. These short runs had automated evidence; the subsequent Main 10 loop received visual confirmation below.
 
 The following 120-second 4K60 Main 10 loop also passed
 (`20260910T215026-06f441.json`). It recorded zero decoder drops and zero output
@@ -59,9 +62,11 @@ older overlay passes to qualify the path.
 The direct-DRM null-output benchmark could not initialize hardware decoding.
 It supplies no valid decoder throughput or speed-limit result. All these trials
 exited cleanly and restored the receiver; no current thermal/power throttling
-was observed. The existing AirPlay receiver configuration remains unchanged.
-Seeking, container comparisons and actual AirPlay HEVC hardware integration
-remain unqualified; the current results do not establish native 4K HDMI output.
+was observed. The standalone suite left the receiver configuration unchanged.
+Subsequent AirPlay hardware smoke checks are recorded separately in the
+[receiver trial](hevc-airplay-trial.md). Seeking, the full container matrix and
+longer real UHF playback remain unqualified; these results do not establish
+native 4K HDMI output.
 
 ## What we can establish
 
@@ -264,12 +269,14 @@ inspect the system before another test. No automatic reboot is attempted.
 
 ## What follows a successful qualification
 
-Only after a hardware path passes playback, control, shutdown and longer tests
-should it be added as an isolated receiver experiment. Reuse these fixtures
-through direct AirPlay, then compare paced TS, HLS, and real UHF streams while
-checking that audio packets arrive. The current receiver deliberately leaves
-HEVC hardware disabled; sending 4K fixtures to it today would test its software
-path. Do not interpret that as this hardware qualification.
+The successful `overlay-primary` arrangement was subsequently integrated into
+the opt-in `pi4-hevc-experimental` receiver policy, with short direct-AirPlay
+HEVC/H.264 smoke checks. Use [the receiver trial](hevc-airplay-trial.md) for its
+exact options and limitations. Reuse these fixtures through direct AirPlay,
+then compare paced TS, HLS and actual UHF while checking that audio packets arrive.
+The default `software` and `pi4-safe` mpv policies still use software HEVC;
+verify the selected policy and observed decoder when interpreting a new test.
+HEVC seeking and longer real-stream recovery remain separate gates.
 
 The earlier UHF failure also involved missing usable audio at the selected
 queue. Successful generated HEVC tests cannot establish that UHF stream is

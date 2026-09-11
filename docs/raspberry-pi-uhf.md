@@ -1,4 +1,8 @@
-# Install the UHF compatibility build on Raspberry Pi OS Lite
+# Original UHF installation and recovery baseline
+
+This installs the historical `v1.73.7-uhf.1` GStreamer build, not the later mpv
+receiver or its HEVC/startup fixes. For the current documented receiver, start
+with [the fork overview](../FORK.md) and use [the managed development workflow](development-on-pi.md).
 
 These instructions target a Raspberry Pi 4 with HDMI output and an existing UxPlay service. Start from [upstream installation instructions](../README.md) if UxPlay has not been installed before. Use the same Linux account as the original service.
 
@@ -83,6 +87,24 @@ nofreeze
 
 Keep exactly one `hls` line. `hls` selects playbin3. The dimensions and frame rate apply to screen mirroring, not direct-stream downscaling. The direct-video renderer uses ALSA's default output; an explicit `as alsasink` alone does not set playbin's audio device. Preserve the working `~/.asoundrc` and check audio with `aplay -l` and `speaker-test -D default -c 2 -t wav -l 1`.
 
+The original HDMI audio repair set the receiver user's ALSA default to the
+verified `vc4hdmi0` output. This was the working `~/.asoundrc` recipe:
+
+```text
+pcm.!default {
+    type plug
+    slave.pcm "hw:CARD=vc4hdmi0,DEV=0"
+}
+ctl.!default {
+    type hw
+    card vc4hdmi0
+}
+```
+
+Recreate it only if needed after checking the actual audio card and preserving
+any existing custom configuration. mpv uses its own `mpv-audio-device` setting;
+working audio-only AirPlay does not establish audio packets in a UHF video stream.
+
 ## Foreground test
 
 The service must remain stopped while this copy is running:
@@ -151,4 +173,6 @@ This restores the original service command and original binary, including their 
 
 Measure startup time with a 1080p stream, then compare 4K. Note CPU use (`top`), power/thermal flags (`vcgencmd get_throttled`), temperature (`vcgencmd measure_temp`), GStreamer version and the actual decoder selected. Comparing Ethernet with Wi-Fi can help isolate the network path. Decoder availability from `gst-inspect-1.0` does not prove that a particular decoder is used.
 
-See [FORK.md](../FORK.md) for the limited testing evidence and outstanding work. Neither reliable 4K playback nor faster startup has been established for this branch.
+See [the retained playback findings](playback-findings.md) for later startup,
+H.264 and HEVC results and the remaining UHF failures. Those results do not
+apply to the original tagged build installed by this guide.

@@ -1,23 +1,17 @@
 # AirPlay video backend and HDMI feedback
 
-Latest Pi update, 10 September 2026: `mpv-render-profile fast` with
-`mpv-h264-hwdec v4l2m2m` substantially improves 1080p60 HDMI playback. The
-independent AirPlay fixture now has user-confirmed smooth picture and sound
-with the full debug overlay. Some output frames are still dropped; this is not
-lossless 60 fps or long-run qualification. The render-profile option defaults
-to `default`, and hardware decoding remains restricted to H.264. See
-[Pi qualification](pi-mpv-qualification.md) for the controlled comparisons.
-The implementation history below records the earlier software-only baseline.
+Latest recorded Pi update, 10 September 2026: `mpv-render-profile fast` with
+direct H.264 hardware output improved 1080p60 playback. The later opt-in
+`pi4-hevc-experimental` policy also enables HEVC hardware decoding with video
+on the primary display plane. See [the HEVC receiver trial](hevc-airplay-trial.md),
+[the controlled comparisons](playback-findings.md), and [current status](../FORK.md).
 
-The same YouTube 1080p60 source was subsequently retested on the deployed
-release `20260910T193744320774Z-52c2997e3800-dirty`; the user confirmed smooth
-picture and sound. The live capture showed direct H.264 hardware output,
-audio/video synchronization at zero and about 7.9 output drops/second over a
-62-second interval, compared with about 44.5/second before. HEVC software
-playback, H.264 seeking and clean child shutdown also passed the targeted
-regression checks. The earlier failing UHF HEVC source remains a separate issue.
-
-Implementation status: development build, 10 September 2026. The optional mpv backend and HDMI status/debug modes are implemented, built on the projector's Raspberry Pi, and tested there with software decoding and headless outputs. The user activated the preview and supplied a photo confirming a working H.264 picture and debug overlay. Hardware decoding, HEVC/4K and full playback acceptance remain unqualified. No OS image is created.
+The optional mpv backend and HDMI status/debug modes are implemented. Hardware
+qualification progressed to user-confirmed standalone 4K60 Main 10 picture/tone
+and short receiver HEVC/H.264 checks. Actual failing UHF streams, longer playback
+and full handover acceptance remain open. The validation history below records
+earlier software-only and H.264-only stages; their limitations are not the latest
+hardware policy.
 
 ## Build and select
 
@@ -64,9 +58,9 @@ Use `mpv-drm-device`, `mpv-drm-connector` and `mpv-audio-device` only after iden
 | --- | --- |
 | `software` | Uses `hwdec=no`. This is the default mpv development baseline, including for HEVC. It makes no promise of real-time 4K performance. |
 | `pi4-safe` | Requires an explicitly qualified `mpv-h264-hwdec` setting, currently `v4l2m2m` or `v4l2m2m-copy`. Hardware decoding is restricted to H.264; HEVC remains software. The local mpv build must actually support the selected method. |
-| `pi4-hevc-experimental` | Opt-in Pi mode following successful standalone 4K60 Main/Main 10 tests. Requires H.264 `v4l2m2m`, `gpu`/`drm`/`opengl` and `fast`. Adds stateless `drm` HEVC decoding, primary-plane video and a separate 1280×720 OSD plane. Runtime software fallback is disabled. Receiver integration and real streams must still be tested. |
+| `pi4-hevc-experimental` | Opt-in Pi mode following successful standalone 4K60 Main/Main 10 tests. Requires H.264 `v4l2m2m`, `gpu`/`drm`/`opengl` and `fast`. Adds stateless `drm` HEVC decoding, primary-plane video and a separate 1280×720 OSD plane. Runtime software fallback is disabled. Short receiver checks passed; failing UHF sources and longer real streams remain to qualify. |
 
-The existing `hls-pi4` cached-YouTube H.264/AAC-LC selection remains available. It does not transcode UHF media or turn a direct 4K H.264 stream into HEVC. See [Pi qualification](pi-mpv-qualification.md) for the separate device checks. The implementation gives us a second decoder/demuxer path to diagnose the current HEVC/4K failures; it does not certify those failures fixed.
+The existing `hls-pi4` cached-YouTube H.264/AAC-LC selection remains available. It does not transcode UHF media or turn a direct 4K H.264 stream into HEVC. See [the playback findings](playback-findings.md) for the separate device checks. The implementation gives us a second decoder/demuxer path to diagnose the current HEVC/4K failures; it does not certify those failures fixed.
 
 ## Screen behavior
 
@@ -105,6 +99,8 @@ python3 -m unittest discover -s tests -p 'test_pi*.py'
 The Linux test suite covers status state/generation handling, real headless status and video-overlay rendering, no audio owner in the idle presenter, GStreamer decoder/memory preservation, fake mpv IPC faults and child lifetimes, receiver callback/ownership transitions, stale cache/control requests, and actual mpv HTTP MP4, MPEG-TS HLS, fMP4 HLS, separate audio HLS and software HEVC. Actual mpv media tests use null video/audio outputs.
 
 Before activation is considered successful, test the actual phone-to-projector path: idle HDMI feedback, UHF HD H.264, the failing HEVC and 4K examples, YouTube, mirroring and audio-only AirPlay; picture and sound separately; pause/seek/resume; channel/phone switching; disconnect and stop; clean receiver shutdown and subsequent device reacquisition. Compare debug on/off and retain the previous release/configuration for rollback.
+
+### Earlier software-preview validation
 
 Observed verification on 10 September 2026: both optional-enabled and default-disabled builds compiled in an aarch64 Debian Trixie container (GStreamer 1.26.2, mpv 0.40.0, FFmpeg runtime 7.1.5, json-c 0.18). All 19 CTest groups passed in the enabled build; six relevant screen/audio/cache/direct-renderer groups also passed in the disabled build. All 21 local deployment-helper tests passed. Focused model and mpv adapter suites passed AddressSanitizer/UndefinedBehaviorSanitizer checks. Actual idle/status/error and video-overlay frames were rendered and visually inspected.
 

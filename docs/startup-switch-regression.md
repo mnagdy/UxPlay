@@ -53,15 +53,10 @@ resume and shutdown. These are headless tests, not iPhone latency acceptance.
 
 Pi release `20260910T212127226779Z-52c2997e3800-dirty` was activated by the user
 and verified running as PID 13469 with zero service restarts. Its configuration
-is unchanged. The activation command used was:
-
-```sh
-python3 ~/uxplay-dev/state/activate-startup-switch.py
-```
-
-The activation helper validates candidate binary/source checksums, the previous
+is unchanged. The one-use activation was completed; its obsolete local helper
+was removed during cleanup. The activation helper validated candidate binary/source checksums, the previous
 release, configuration and player inactivity. It uses managed service switching
-with rollback on failure. Rollback is the working HEVC receiver
+with rollback on failure. At this checkpoint, rollback was the working HEVC receiver
 `20260910T210453311246Z-52c2997e3800-dirty`.
 
 After activation, two generated files were submitted through AirPlay at an
@@ -113,14 +108,14 @@ its cache and HTTP handler groups.
 
 Pi release `20260910T213612844711Z-52c2997e3800-dirty` was activated after
 the user disconnected AirPlay, with unchanged configuration. The managed
-health check passed; PID 14044 is running with zero restarts. The activation
-helper is:
+health check passed; PID 14044 was recorded running with zero restarts.
+This one-use activation also completed; its obsolete local helper was removed.
+Use [the maintained development workflow](development-on-pi.md) for new
+activation or managed rollback. The checks included exact previous release,
+candidate source/binary hashes, expected HEVC configuration, no pending reboot,
+no competing mpv/FFmpeg, and service health with rollback on failure.
 
-```sh
-python3 ~/uxplay-dev/state/activate-hls-startup.py
-```
-
-Rollback is `20260910T212127226779Z-52c2997e3800-dirty`.
+The recorded rollback target is `20260910T212127226779Z-52c2997e3800-dirty`.
 
 The user reported an eight-second initial start, then confirmed that switching
 videos is pretty fast. PID 14044 shows:

@@ -34,13 +34,11 @@ Atomic frame-commit rejection now records `frame-present-failure` and counts
 as a video-output error even when mpv emits it at warning level. This avoids
 interpreting a zero drop counter as proof of successful display submission.
 
-The trial release is `20260910T210453311246Z-52c2997e3800-dirty`. The managed
-rollback points to `20260910T193744320774Z-52c2997e3800-dirty`, the previously
-verified H.264 receiver. From this checkout:
-
-```sh
-python3 scripts/pi-dev rollback --host mo@192.168.1.124
-```
+The trial release was `20260910T210453311246Z-52c2997e3800-dirty`. At that
+checkpoint, managed rollback targeted `20260910T193744320774Z-52c2997e3800-dirty`,
+the previously verified H.264 receiver. Later activations changed that target:
+see [the startup record](startup-switch-regression.md) and inspect managed state
+through [the development workflow](development-on-pi.md) before rollback.
 
 Native compilation succeeded. Linux checks passed for backend lifecycle,
 controls, replacement, protocol/HTTP playback, receiver selection, screen
