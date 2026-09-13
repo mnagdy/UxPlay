@@ -35,6 +35,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include "../lib/logger.h"
+#include "screen_status.h"
 
 typedef enum videoflip_e {
     NONE,
@@ -46,6 +47,20 @@ typedef enum videoflip_e {
 } videoflip_t;
 
 typedef struct video_renderer_s video_renderer_t;
+
+/* Call once after GStreamer initialization, before creating any pipelines. */
+void video_renderer_configure_pi4(logger_t *logger);
+
+/* Configure before renderer initialization. OFF preserves the existing video
+ * pipelines. Refresh is a main-loop operation (about 1 Hz and state changes).
+ * SystemMemory frames support the first overlay; opaque hardware buffers are
+ * reported as unqualified without changing decoder or caps negotiation. */
+void video_renderer_configure_screen(screen_info_mode_t mode);
+void video_renderer_screen_refresh(void);
+/* Release every video pipeline before the idle display takes ownership.
+ * Returns true only when all pipelines report NULL. The caller must release
+ * idle output before start/choose_codec. This cannot bound a kernel ioctl hang. */
+bool video_renderer_suspend_output(void);
 
 void video_renderer_init (logger_t *logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char *rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options,
@@ -59,6 +74,7 @@ void video_renderer_pause ();
 void video_renderer_hls_ready ();
 void video_renderer_seek(float position);
 void video_renderer_set_start(float position);
+void video_renderer_set_start_with_source(float position, bool direct_http);
 void video_renderer_resume ();
 int video_renderer_cycle ();
 bool video_renderer_is_paused();
@@ -71,6 +87,10 @@ void video_renderer_destroy ();
 void video_renderer_size(float *width_source, float *height_source, float *width, float *height);
 bool waiting_for_x11_window();
 bool video_get_playback_info(double *duration, double *position, double *seek_start, double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full);
+/* Read readiness with the timeline under the same renderer lifetime lock. */
+bool video_get_playback_info_with_readiness(double *duration, double *position, double *seek_start,
+    double *seek_duration, float *rate, bool *buffer_empty, bool *buffer_full,
+    bool *ready_to_play, bool *likely_to_keep_up);
 int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265);
 unsigned int video_renderer_listen(void *loop, int id);
 bool video_renderer_eos_watch();
@@ -80,4 +100,3 @@ void video_renderer_hls_set_volume(double volume);
 #endif
 
 #endif //VIDEO_RENDERER_H
-

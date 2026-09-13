@@ -44,6 +44,8 @@ struct http_connection_s {
     connection_type_t type;
     http_request_t *request;
     int pending_remove;
+    char request_prefix[8];
+    size_t request_prefix_len;
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -190,6 +192,7 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
     /* Initial status joined */
     httpd->running = 0;
     httpd->joined = 1;
+    MUTEX_CREATE(httpd->run_mutex);
 
     return httpd;
 }
@@ -199,6 +202,7 @@ httpd_destroy(httpd_t *httpd)
 {
     if (httpd) {
         httpd_stop(httpd);
+        MUTEX_DESTROY(httpd->run_mutex);
         free(httpd->connections);
         free(httpd);
     }
@@ -293,8 +297,9 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
     remote_saddrlen = sizeof(remote_saddr);
     fd = accept(server_fd, (struct sockaddr *)&remote_saddr, &remote_saddrlen);
     if (fd == -1) {
-        /* FIXME: Error happened */
         int sock_err = SOCKET_GET_ERROR();
+        if (sock_err == SOCKET_ERRORNAME(EINTR) || sock_err == SOCKET_ERRORNAME(EAGAIN) ||
+            sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) return 0;
         logger_log(httpd->logger, LOGGER_ERR, "httpd: error in accept: %d %s",
                    sock_err, SOCKET_ERROR_STRING(sock_err));
         return -1;
@@ -362,7 +367,7 @@ httpd_thread(void *arg)
     httpd_t *httpd = arg;
     char http[] = "HTTP/1.1";
     char event[] = "EVENT/1.0";
-    char buffer[1024];
+    char buffer[1025];
 
     bool logger_debug = (logger_get_level(httpd->logger) >= LOGGER_DEBUG);
     assert(httpd);
@@ -422,6 +427,7 @@ httpd_thread(void *arg)
             continue;
         } else if (nfds_set == -1) {
             int sock_err = SOCKET_GET_ERROR();
+            if (sock_err == SOCKET_ERRORNAME(EINTR)) continue;
             logger_log(httpd->logger, LOGGER_ERR,
                        "httpd error in select: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
             break;
@@ -449,7 +455,6 @@ httpd_thread(void *arg)
         }
         for (int i = 0; i < httpd->max_connections; i++) {
             int recv_datalen = 0;
-            int new_request = 0;
             http_connection_t *connection = &httpd->connections[i];
 
             if (!connection->connected) {
@@ -463,14 +468,12 @@ httpd_thread(void *arg)
             if (!connection->request) {
                 connection->request = http_request_init();
                 assert(connection->request);
-                new_request = 1;
+                connection->request_prefix_len = 0;
                 if (connection->type == CONNECTION_TYPE_PTTH) {
-                    http_request_is_reverse(connection->request);
+                    http_request_set_reverse(connection->request);
                 }
                 logger_log(httpd->logger, LOGGER_DEBUG, "new request, connection %d, socket %d type %s",
                            i, connection->socket_fd, typename [connection->type]);
-            } else {
-                new_request = 0;
             }
 
             logger_log(httpd->logger, LOGGER_DEBUG, "httpd receiving on socket %d, connection %d",
@@ -495,50 +498,32 @@ httpd_thread(void *arg)
             }
             /* reverse-http responses from the client must not be sent to the llhttp parser:
              * such messages start with "HTTP/1.1" (or sometimes with "EVENT/1.0")  */
-            if (new_request) {
-                int readstart = 0;
-                new_request = 0;
-                while (readstart < 8) {
-                    int ret = recv(connection->socket_fd, buffer + readstart, sizeof(buffer) - readstart, 0);
-                    if (ret == 0) {
-                        logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
-                                   connection->socket_fd);
-                        httpd_remove_connection(httpd, connection, 0);
-                        break;
-                    } else if (ret == -1) {
-                        if (errno == SOCKET_ERRORNAME(EAGAIN) || errno == SOCKET_ERRORNAME(EWOULDBLOCK) || errno == SOCKET_ERRORNAME(EINTR)) {
-                            continue;
-                        } else {
-                            httpd_remove_connection(httpd, connection, SOCKET_GET_ERROR());
-                            break;
-                        }
-                    } else {
-                        readstart += ret;
-                        recv_datalen = readstart;
-                    }
-                }
-                if (connection->socket_fd == -1) {
-                    /* connection was removed */
+            /* A short TCP read is normal. Save the first eight bytes across
+             * select iterations instead of blocking every client while one
+             * sender is interrupted halfway through a request prefix. */
+            size_t prefix_len = connection->request_prefix_len < 8 ? connection->request_prefix_len : 0;
+            memcpy(buffer, connection->request_prefix, prefix_len);
+            int ret = recv(connection->socket_fd, buffer + prefix_len, sizeof(buffer) - 1 - prefix_len, 0);
+            if (ret == 0) {
+                httpd_remove_connection(httpd, connection, 0);
+                continue;
+            }
+            if (ret < 0) {
+                int error = SOCKET_GET_ERROR();
+                if (error != SOCKET_ERRORNAME(EAGAIN) && error != SOCKET_ERRORNAME(EWOULDBLOCK) &&
+                    error != SOCKET_ERRORNAME(EINTR)) httpd_remove_connection(httpd, connection, error);
+                continue;
+            }
+            recv_datalen = (int)prefix_len + ret;
+            if (connection->request_prefix_len < 8) {
+                if (recv_datalen < 8) {
+                    memcpy(connection->request_prefix, buffer, recv_datalen);
+                    connection->request_prefix_len = (size_t)recv_datalen;
                     continue;
                 }
-                if (!memcmp(buffer, http, 8) || !memcmp(buffer, event, 8)) {
-                    http_request_set_reverse(connection->request);  
-                }
-            } else {
-                int ret = recv(connection->socket_fd, buffer, sizeof(buffer), 0);
-                if (ret == 0) {
-                    httpd_remove_connection(httpd, connection, 0);
-                    continue;
-                } else if (ret == -1) {
-                    if (errno == SOCKET_ERRORNAME(EAGAIN) || errno == SOCKET_ERRORNAME(EWOULDBLOCK) || errno == SOCKET_ERRORNAME(EINTR)) {
-                        continue;
-                    } else {
-                        httpd_remove_connection(httpd, connection, SOCKET_GET_ERROR());
-                        continue;
-                    }
-                } else {
-                    recv_datalen = ret;
-                }
+                connection->request_prefix_len = 8;
+                if (!memcmp(buffer, http, 8) || !memcmp(buffer, event, 8))
+                    http_request_set_reverse(connection->request);
             }
             if (http_request_is_reverse(connection->request)) {
                 /* this is a response from the client to a
@@ -558,12 +543,10 @@ httpd_thread(void *arg)
             /* Parse HTTP request from data read from connection */
             http_request_add_data(connection->request, buffer, recv_datalen);
             if (http_request_has_error(connection->request)) {
-                char *data = utils_data_to_text((const char *) buffer, recv_datalen);
-                logger_log(httpd->logger, LOGGER_ERR, "httpd error in parsing: %s\n%s\n%s",
-                           http_request_get_error_name(connection->request),
-                           http_request_get_error_description(connection->request),
-                           data);
-                free (data);
+                /* A malformed request can contain authorization headers or
+                 * private source locations. Keep the parser code, not bytes. */
+                logger_log(httpd->logger, LOGGER_ERR, "HTTP request parse failed: code=%s received_bytes=%d",
+                           http_request_get_error_name(connection->request), recv_datalen);
                 httpd_remove_connection(httpd, connection, 0);
                 continue;
             }
@@ -596,14 +579,15 @@ httpd_thread(void *arg)
                     written = 0;
                     while (written < datalen) {
                         ret = send(connection->socket_fd, data+written, datalen-written, 0);
-                        if (ret == -1) {
+                        if (ret < 0 && SOCKET_GET_ERROR() == SOCKET_ERRORNAME(EINTR)) continue;
+                        if (ret <= 0) {
                             logger_log(httpd->logger, LOGGER_ERR, "httpd error in sending data");
                             break;
                         }
                         written += ret;
                     }
 
-                    if (http_response_get_disconnect(response)) {
+                    if (written != datalen || http_response_get_disconnect(response)) {
                         logger_log(httpd->logger, LOGGER_INFO, "Disconnecting on software request");
                         httpd_remove_connection(httpd, connection, 0);
                     }
@@ -710,7 +694,7 @@ httpd_is_running(httpd_t *httpd)
     assert(httpd);
 
     MUTEX_LOCK(httpd->run_mutex);
-    running = httpd->running || !httpd->joined;
+    running = httpd->running;
     MUTEX_UNLOCK(httpd->run_mutex);
 
     return running;
@@ -722,7 +706,9 @@ httpd_stop(httpd_t *httpd)
     assert(httpd);
 
     MUTEX_LOCK(httpd->run_mutex);
-    if (!httpd->running || httpd->joined) {
+    /* Failed select/accept can finish the worker before its owner stops it.
+     * It must still be joined before this listener can start again. */
+    if (httpd->joined) {
         MUTEX_UNLOCK(httpd->run_mutex);
         return;
     }

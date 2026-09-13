@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Build only a private waylandsink plugin with the upstream fullscreen fix.
+
+Targets the installed Raspberry Pi GStreamer 1.26.2 ABI. Downloads pinned source
+and matching development headers, never installs packages or replaces system
+libraries. Requires the existing GStreamer base, Wayland and libdrm development
+packages plus a C compiler. Does not start playback, a compositor or services.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import subprocess
+import tarfile
+import tempfile
+
+VERSION = "1.26.2"
+PACKAGE_VERSION = "1.26.2-3+rpt3+deb13u2"
+BASE = "https://archive.raspberrypi.com/debian/pool/main/g/gst-plugins-bad1.0/"
+SOURCES = {
+    "gst-plugins-bad1.0_1.26.2.orig.tar.xz": "cb116bfc3722c2de53838899006cafdb3c7c0bc69cd769b33c992a8421a9d844",
+    "gst-plugins-bad1.0_1.26.2-3+rpt3+deb13u2.debian.tar.xz": "b067efd8825c1c58eb26987e22fa87b87faa061d7a288a922c8724113feac881",
+}
+DEV_PACKAGE = "libgstreamer-plugins-bad1.0-dev_1.26.2-3+rpt3+deb13u2_arm64.deb"
+DEV_SHA256 = "303f49c68225128ae7fc185b99a78dc2204c594575e04b051d6ce6ae53bea793"
+PATCH_SHA256 = "d28b98ed6b2ae904660e6b6d9a21995e389a72f610fd95a4f95daa09421c2fa7"
+UPSTREAM_COMMIT = "96b800f82a3084eec8e4e970a7f5ce6743967e45"
+MODULES = ["gstreamer-1.0", "gstreamer-video-1.0", "gstreamer-wayland-1.0",
+           "gstreamer-allocators-1.0", "libdrm"]
+
+
+def helpers():
+    path = Path(__file__).resolve().with_name("pi-build-weston-trial")
+    loader = importlib.machinery.SourceFileLoader("piplay_build_dependencies", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def output(args, env=None):
+    return subprocess.run([str(a) for a in args], env=env, check=True,
+                          text=True, capture_output=True).stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.home() / "uxplay-dev/waylandsink-trial")
+    args = parser.parse_args()
+    if os.geteuid() == 0 or platform.system() != "Linux" or platform.machine() != "aarch64":
+        parser.error("Run unprivileged on the aarch64 Raspberry Pi.")
+    root = args.root.expanduser().resolve()
+    if not root.is_relative_to(Path.home().resolve()) or root == Path.home().resolve():
+        parser.error("Use a dedicated directory inside your home.")
+    root.mkdir(parents=True, exist_ok=True)
+    h = helpers()
+    baseline = {}
+    for name in ["gstreamer1.0-plugins-bad", "libgstreamer-plugins-bad1.0-0"]:
+        baseline[name] = output(["dpkg-query", "-W", "-f=${Version}", name]).strip()
+        if baseline[name] != PACKAGE_VERSION:
+            raise RuntimeError("The installed GStreamer Bad package differs from the pinned source ABI.")
+    for name in MODULES[:2]:
+        if output(["pkg-config", "--modversion", name]).strip() != VERSION:
+            raise RuntimeError("The existing GStreamer development ABI must be 1.26.2.")
+    patch = Path(__file__).resolve().parent.parent / "patches/gst-waylandsink-fullscreen.patch"
+    if h.sha256(patch) != PATCH_SHA256:
+        raise RuntimeError("Upstream fullscreen patch digest changed.")
+    metadata = output(["apt-cache", "show", "libgstreamer-plugins-bad1.0-dev=" + PACKAGE_VERSION])
+    if not re.search(r"^SHA256: " + DEV_SHA256 + r"$", metadata, re.M):
+        raise RuntimeError("APT metadata does not match the pinned development package.")
+    lock = {"packages": [{"package": "libgstreamer-plugins-bad1.0-dev", "version": PACKAGE_VERSION,
+                           "file": DEV_PACKAGE, "url": BASE + DEV_PACKAGE, "sha256": DEV_SHA256}]}
+    # Extract only headers/pkg-config metadata; required runtime libraries are
+    # already installed. Do not resolve the dev package's unrelated OpenCV deps.
+    deps = h.extract_dependencies(root, lock)
+    archives = root / "archives"
+    for name, digest in SOURCES.items():
+        h.download(BASE + name, archives / name, digest)
+    source = root / "source/gst-plugins-bad-1.26.2"
+    digest = hashlib.sha256(json.dumps(SOURCES, sort_keys=True).encode() + PATCH_SHA256.encode()).hexdigest()
+    stamp = root / "source-patch.sha256"
+    if source.exists() and (not stamp.exists() or stamp.read_text().strip() != digest):
+        raise RuntimeError("Existing source has another patch set; use a fresh --root.")
+    if not source.exists():
+        source.parent.mkdir(exist_ok=True)
+        with tarfile.open(archives / "gst-plugins-bad1.0_1.26.2.orig.tar.xz") as archive:
+            archive.extractall(source.parent, filter="data")
+        with tarfile.open(archives / "gst-plugins-bad1.0_1.26.2-3+rpt3+deb13u2.debian.tar.xz") as archive:
+            archive.extractall(source, filter="data")
+        for line in (source / "debian/patches/series").read_text().splitlines():
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if "/" in entry or " " in entry or entry.startswith("-"):
+                raise RuntimeError("Unexpected package patch-series entry.")
+            h.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", source / "debian/patches" / entry], cwd=source)
+        h.run(["patch", "--batch", "--fuzz=0", "-p3", "-i", patch], cwd=source)
+        stamp.write_text(digest + "\n")
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith("GST_PLUGIN_") or key.startswith("GST_REGISTRY") or key == "LD_LIBRARY_PATH":
+            env.pop(key)
+    env["PKG_CONFIG_PATH"] = str(deps / "usr/lib/aarch64-linux-gnu/pkgconfig")
+    if output(["pkg-config", "--modversion", "gstreamer-wayland-1.0"], env).strip() != VERSION:
+        raise RuntimeError("Private Wayland development headers have the wrong version.")
+    plugins = root / "plugins"
+    plugins.mkdir(exist_ok=True)
+    plugin = plugins / "libgstwaylandsink.so"
+    if plugin.exists():
+        raise RuntimeError("This candidate already exists; use a fresh --root to preserve its hash.")
+    cflags = shlex.split(output(["pkg-config", "--cflags", *MODULES], env))
+    libs = shlex.split(output(["pkg-config", "--libs", *MODULES], env))
+    command = ["cc", "-shared", "-fPIC", "-O2", "-g", "-Wall", "-Wextra", "-Wl,-z,defs",
+               "-DGST_USE_UNSTABLE_API", '-DVERSION="1.26.2"', '-DPACKAGE="gst-plugins-bad"',
+               '-DGST_PACKAGE_NAME="PiPlay fullscreen trial"',
+               '-DGST_PACKAGE_ORIGIN="https://gstreamer.freedesktop.org/"',
+               *cflags, str(source / "ext/wayland/gstwaylandsink.c"), "-o", str(plugin), *libs]
+    h.run(command, env=env)
+    linked = output(["ldd", plugin], env)
+    if "not found" in linked or str(root / "deps") in linked:
+        raise RuntimeError("Private plugin must resolve installed runtime libraries only.")
+    runtime = re.search(r"libgstwayland-1\.0\.so\.0 => (\S+)", linked)
+    if not runtime:
+        raise RuntimeError("Plugin does not link the installed GStreamer Wayland library.")
+    # Exclude the duplicate system sink and create a fresh registry. This also
+    # supplies an explicit selection environment for independent regressions.
+    inspect_system = output(["gst-inspect-1.0", "waylandsink"], env)
+    system_match = re.search(r"^\s*Filename\s+(\S+)$", inspect_system, re.M)
+    if not system_match:
+        raise RuntimeError("Cannot identify the installed plugin directory.")
+    system_dir = Path(system_match.group(1)).parent
+    filtered = root / "system-plugins"
+    filtered.mkdir(exist_ok=True)
+    for item in system_dir.iterdir():
+        if item.is_file() and item.suffix == ".so" and item.name != plugin.name:
+            target = filtered / item.name
+            if not target.exists():
+                target.symlink_to(item)
+    env.update(GST_PLUGIN_PATH_1_0=str(plugins), GST_PLUGIN_SYSTEM_PATH_1_0=str(filtered))
+    with tempfile.TemporaryDirectory(prefix="registry-", dir=root) as registry:
+        env["GST_REGISTRY"] = str(Path(registry) / "registry.bin")
+        output(["gst-inspect-1.0", plugin], env)
+        inspection = output(["gst-inspect-1.0", "waylandsink"], env)
+    selected = re.search(r"^\s*Filename\s+(\S+)$", inspection, re.M)
+    if not selected or Path(selected.group(1)).resolve() != plugin.resolve():
+        raise RuntimeError("GStreamer did not select the exact private waylandsink plugin.")
+    (root / "gst-inspect.txt").write_text(inspection)
+    (root / "ldd.txt").write_text(linked)
+    manifest = {"version": VERSION, "baseline_packages": baseline, "source_archives": SOURCES,
+                "source_base": BASE, "development_package": lock["packages"][0],
+                "upstream_commit": UPSTREAM_COMMIT, "patch_sha256": PATCH_SHA256,
+                "plugin": str(plugin), "plugin_dir": str(plugins), "binary_sha256": h.sha256(plugin),
+                "system_plugin_dir": str(filtered), "selected_plugin": selected.group(1),
+                "runtime_wayland_library": runtime.group(1), "runtime_wayland_sha256": h.sha256(Path(runtime.group(1))),
+                "library_path": "", "compile": command,
+                "qualification": "Build, linkage and exact plugin selection only; no display/playback test performed."}
+    (root / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()

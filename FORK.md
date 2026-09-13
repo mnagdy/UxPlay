@@ -1,91 +1,94 @@
 # Raspberry Pi UHF compatibility branch
 
-This branch starts from upstream UxPlay **v1.73.7** and backports the existing direct HTTP/HTTPS video playback implementation. It is a small compatibility branch, not an official UxPlay release.
+This fork starts from upstream UxPlay **v1.73.7**, adds direct HTTP/HTTPS video
+compatibility, and contains the projector receiver work. The upstream
+[README](README.md), platform helpers and licenses are retained.
 
-The original upstream README and licenses are retained. General upstream documentation is in [README.md](README.md).
+## Recorded status — 11 September 2026
 
-## Provenance
+The latest documented Pi release is
+`20260910T213612844711Z-52c2997e3800-dirty`. It uses the optional mpv backend for
+direct AirPlay video and its audio, with `pi4-hevc-experimental` decoding and
+the `fast` render profile. GStreamer remains the build default and handles
+mirroring and audio-only AirPlay. This is the last saved device result, not a
+live-device verification by the repository cleanup.
 
-- Base: `df67c212a433cf6dda3676dd40c097900d24e645` (`v1.73.7`).
-- Direct video handling: `6f9250414ee33a4e008b6a7638ac448ace0395c9`.
-- Follow-up routing change: `2ece5790c0cd834291006f0ceb5b6b0e6a7abbee`.
-- Both changes were cherry-picked with their original authors and upstream commit references.
+The user confirmed YouTube/iPlayer picture and sound and fast YouTube video
+switching. An independent two-minute 4K60 Main 10 HEVC trial had smooth picture
+and tone, clean stop, and no steady-playback output drops. Short receiver checks
+also passed HEVC and H.264 playback/stop. The HDMI display was **720p60**: these
+results concern decoding 4K source material, not native 4K HDMI output.
 
-In stock 1.73.7, a direct URL such as `http://phone-address:port/stream.m3u8` is rejected by the YouTube-oriented URL handling. This branch forwards ordinary HTTP/HTTPS locations to the existing GStreamer playback path. It does not depend on the playlist being named `master.m3u8`.
+Still open:
 
-## Installation
+- **UHF combined video/audio playback.** Audio-only AirPlay works, but some
+  video sessions are silent or stall. Captured GStreamer fragments had no audio
+  samples; a later mpv capture had 1,250 selected video packets and zero selected
+  audio packets. On 11 September, three complete Sky News fragments from the
+  phone export contained 750 video samples and zero audio samples, despite sound
+  inside UHF. A later UHF log records exporter write errors. These narrow that
+  sample to an export-writing problem; the exact cause and fix remain open.
+  See [the direct export investigation](docs/diagnostics/2026-09-11-sky-news-export.md).
+- **Channel 4 compatibility: cause confirmed.** On 11 September, the actual
+  stream declared FairPlay Streaming (SAMPLE-AES, Apple key format, `skd` URI).
+  Key-open failure preceded decoder errors, and software decoding stalled too.
+  UxPlay/mpv lacks the required protected key-delivery path; playback remains
+  unavailable. See [the captured diagnosis](docs/diagnostics/2026-09-11-channel4.md).
+  The separate GStreamer key-validation patch does not add FairPlay support.
+- **Initial YouTube startup.** Switching improved and the old item stays paused,
+  but one initial/resumed start still took about eight seconds after most cache
+  preparation was already complete.
+- **Qualification and diagnostics.** Longer real UHF/HEVC playback, HEVC seeking,
+  mirroring/audio handovers, both phones, and remaining GStreamer/RAOP observation
+  gaps need verification. See the findings and logging records below.
 
-See [the Raspberry Pi guide](docs/raspberry-pi-uhf.md). The reproducible starting point is tag **`v1.73.7-uhf.1`**; development continues on **`pi-uhf`**. The executable still reports `1.73.7`, so retain the source revision and distinguish the installed binary by its filename.
+## Documentation
 
-For local iteration, see [developing on the Mac and deploying to the Pi](docs/development-on-pi.md). The development helper keeps incremental builds and separate releases on the Pi, with a dedicated service override and rollback. Playback optimisation proposals are in [the Pi performance plan](docs/raspberry-pi-performance.md).
+| Record | Purpose |
+| --- | --- |
+| [AirPlay reliability audit](docs/diagnostics/2026-09-13-airplay-reliability-audit.md) | 13 September source audit, scoped recovery fixes, protocol research and remaining architecture work |
+| [Playback findings](docs/playback-findings.md) | Consolidated resolved bugs, Pi/GStreamer/HEVC quirks, unresolved work and independent test reruns |
+| [Development and rollback](docs/development-on-pi.md) | Maintained `scripts/pi-dev` build, deployment, recovery and regression workflow |
+| [Original installation](docs/raspberry-pi-uhf.md) | Historical tagged GStreamer baseline and initial service setup |
+| [mpv and HDMI configuration](docs/mpv-screen-development.md) | Current options, backend ownership, screen behavior and implementation constraints |
+| [Continuous display prototype](docs/continuous-display.md) | Opt-in Wayland ownership, captured transition checks, prepared Pi trial and remaining hardware gates |
+| [HEVC qualification suite](docs/hevc-4k-test-plan.md) | Preserved fixtures, staged reruns, display-plane findings and acceptance gates |
+| [HEVC receiver trial](docs/hevc-airplay-trial.md) | Exact hardware policy, short receiver results and rollback history |
+| [Startup and switching](docs/startup-switch-regression.md) | Latest changes, measured startup stages and remaining delay |
+| [Playback logging audit](docs/playback-logging-audit.md) | Captured evidence, interpretation limits and outstanding probes |
+| [GStreamer dependency patch](patches/README.md) | AES-128 key validation and encrypted regression tests |
 
-## Evidence and remaining work
+The [dated investigations](docs/diagnostics/) preserve the detailed UHF evidence.
+Generated media, reports and selected experimental helpers remain in `.pi-dev/`;
+the versioned [evidence index](docs/local-evidence.md) distinguishes historical observations
+from open issues. The raw reports and media are local and ignored by Git. Keep media, HLS segments,
+playlists and fixture metadata together when backing them up.
 
-The equivalent backport was built on a Raspberry Pi 4 running Raspberry Pi OS Lite. Its user reported successful UHF live TV and series playback. This is a limited device report, not an exhaustive compatibility test.
+All maintained `scripts/` and `tests/` files are retained. A successful software
+test or active service does not establish visible picture, audible sound or
+safe hardware teardown; device acceptance is recorded separately.
 
-Open investigation items:
+## Provenance and recovery history
 
-- Roughly 20 seconds from selecting the AirPlay receiver to video starting.
-- Low frame rate with some 4K content; the selected decoder and power/thermal state have not been measured.
-- AirPlay discovery after reboot was confirmed on 9 September 2026; investigate further only if it recurs.
-- Channel changes, reconnects, phone lock/background behaviour, two-phone handover, extended playback and long seeks need recorded verification.
+- Upstream base: `df67c212a433cf6dda3676dd40c097900d24e645` (`v1.73.7`).
+- Direct-video backport: `6f9250414ee33a4e008b6a7638ac448ace0395c9` and
+  routing follow-up `2ece5790c0cd834291006f0ceb5b6b0e6a7abbee`.
+- Initial reproducible compatibility tag: `v1.73.7-uhf.1`; development branch:
+  `pi-uhf`. The executable version alone remains `1.73.7` and cannot identify
+  later builds.
+- Verified 9 September baseline commit:
+  `52c2997e380084a44a0bea95846bbbd5e444013d`, preserving release
+  `20260909T101349217073Z-cd33afca3ada-dirty`.
+  Executable SHA-256:
+  `0b2e79b31ead385e07eef59e2012117042d5a104870d99e393bd0a9ea46ab8a2`.
+  Source fingerprint:
+  `907c7d7bde908bd5a6bc9bb682777b4a4b9744b0dd8bd1bba371de4d3d7a9621`.
+- The separate stable `/usr/local/bin/uxplay` and original
+  `/usr/local/bin/uxplay-uhf-test` installations are historical rollback paths.
+  Later development releases use the managed service override and rollback
+  described in the development guide; do not confuse the two override schemes.
 
-Keep playbin3 (`hls`) as the initial configuration. A playbin2 (`hls 2`) experiment is not a validated improvement.
-
-Potential development areas are startup timing instrumentation, live-stream playback status, buffering/pause handling and error recovery. Establish measurements before changing these behaviours. This branch does not add DRM support, HEVC hardware drivers, or a proven low-latency configuration.
-
-## First playback iteration
-
-The development working tree now separates requested pause/play/stop from buffering, handles 0% buffering and streams without buffering notifications, preserves pause while seeking, validates long seek positions, and reports live position without requiring a finite duration. Controls received during renderer rebuilding retain their intent; superseded renderer bus/EOS events are ignored. This does not redesign all application threading or mirroring behaviour.
-
-`Direct playback:` log entries identify the selected decoder and input format, decoded-frame memory, initial buffering milestones and first arrival at the video sink. Sink arrival is not physical presentation, and a DMA-BUF observation alone does not establish end-to-end zero-copy. No driver, decoder preference or buffering-size changes are included in this iteration.
-
-Optional headless regression tests use `-DUXPLAY_BUILD_TESTS=ON`; see [the development guide](docs/development-on-pi.md). Real UHF startup time and 4K frame rate still require before/after measurements on the Pi.
-
-Validation on 9 September 2026: all three C/GStreamer test groups passed on Debian Trixie ARM64 and on a Raspberry Pi 4 with kernel `6.18.34+rpt-rpi-v8` and GStreamer `1.26.2`. Linux AddressSanitizer/UndefinedBehaviorSanitizer checks passed with leak detection disabled for that integrated run; 19 deployment-helper tests also passed. The first iteration was built natively and deployed with a successful process-health check. UHF playback comparison is pending.
-
-## YouTube first-frame freeze
-
-On 9 September, the Pi's YouTube master playlist advertised 18 audio/video entries while its cache had fetched only the first few. A repeated `/play` request reused that incomplete cache because the old check required only a playback location. GStreamer decoded a first frame, then stayed paused while repeatedly receiving HTTP 404 for an uncached quality variant. A generated HTTP HLS stream with a missing advertised variant reproduced that stall; the same stream with all variants available played from both zero and a 165-second resume position.
-
-Cached YouTube playback now requires the master and every referenced cache entry to be present, including duplicate URI aliases. An interrupted cache is fetched again on a repeated play request. FCUP responses must match the outstanding URL before they can advance collection, and a duplicate final response cannot restart playback. Direct HTTP playback used by UHF retains its separate path. Logs are flushed by line so the journal shows playback events promptly.
-
-The first device retest exposed the reason collection had stopped: YouTube returned HTTP 404 for a media playlist even though it appeared in the master. Collection now continues past unavailable media playlists. Before playback, the master is filtered to available variants and audio renditions; variants whose required audio group is unavailable are removed too. A failed master or a cache with no playable variant is still rejected. This prevents an adaptive quality switch from requesting a playlist the receiver cannot serve.
-
-These changes address incomplete playlist reuse. They do not establish an improvement to 4K decoding or eliminate the time spent fetching YouTube's playlists. The later Pi 4 profile device test is recorded below.
-
-Validation: six C/HTTP/GStreamer test groups passed on Debian Trixie ARM64 with AddressSanitizer and UndefinedBehaviorSanitizer (integrated leak detection disabled), including the unavailable-variant fallback. Tests cover failed audio dependencies, all variants failing, duplicate URI aliases and delayed responses with an older request ID. The HTTP handler test fails with premature playback when only the old cache-reuse condition is restored, and passes with the fix. Five test groups also passed natively on the Pi for the final fallback build; its FFmpeg-dependent HTTP media fixture is not installed. Release `20260909T095659695775Z-cd33afca3ada-dirty` was deployed with successful process-health checks. The later Pi 4 profile device test is recorded below.
-
-## Pi 4 YouTube codec compatibility
-
-The next device retest successfully completed the playlist cache but still froze after the first frame. On the Pi's GStreamer 1.26.2, the master offered both H.264 and VP9; hlsdemux2 failed to construct common video caps and stopped with a flow error before playback began. The same cached video reproduced the failure with headless audio/video sinks. Restricting that master to its available H.264/AAC-LC variants allowed the playback clock to advance on the Pi. A generated mixed-codec HLS fixture also reproduced the demux error independently.
-
-The opt-in `-hls-pi4` option (configuration line `hls-pi4`) now filters cached YouTube variants to declared H.264/AAC-LC, at most 1920×1080 and at most 60 fps when declared. It keeps adaptive choices within that codec family, rejects a cache with no matching variant, and does not change UHF's direct HTTP route. It is metadata selection, not transcoding or a guarantee that all H.264 profiles are supported. Unconfigured receivers retain the existing selection behaviour.
-
-Bounded error diagnostics report the failing element's factory, error domain/code and an allowlisted flow reason without copying the error message, debug payload or signed stream URL. The successful device playback report is recorded below.
-
-Validation of the Pi 4 profile: all six C/HTTP/GStreamer groups passed on Debian Trixie ARM64 with AddressSanitizer/UndefinedBehaviorSanitizer (integrated leak detection disabled), including the generated mixed-codec failure and filtered initial/resume playback. All five test groups available natively on the Pi passed. Release `20260909T101349217073Z-cd33afca3ada-dirty` was activated with a separate `hls-pi4` configuration and remained running after reboot.
-
-
-## Confirmed working baseline — 9 September 2026
-
-After reboot, the receiver started automatically with no service restarts. Its AirPlay and audio advertisements were visible from the Mac, and the advertised TCP port accepted a connection. The user then confirmed AirPlay was working and reported that YouTube playback and switching videos worked very well. This confirms the tested device workflow; extended playback, phone handover and 4K performance still need separate testing.
-
-The source and test files in this commit match the archived source for the running release `20260909T101349217073Z-cd33afca3ada-dirty`; subsequent changes only update documentation. The deployed executable has SHA-256 `0b2e79b31ead385e07eef59e2012117042d5a104870d99e393bd0a9ea46ab8a2`. The release's original source fingerprint is `907c7d7bde908bd5a6bc9bb682777b4a4b9744b0dd8bd1bba371de4d3d7a9621`.
-
-Working receiver configuration:
-
-```text
-n Projector
-nh
-s 1920x1080
-fps 30
-vs kmssink
-as alsasink
-hls
-nohold
-nofreeze
-hls-pi4
-```
-
-Before committing, all 19 deployment-helper tests and all five headless test groups available on the Pi passed again. The optional FFmpeg-dependent HTTP HLS fixture is not installed on the Pi; its earlier container validation is recorded above.
+The cleanup preserves the existing uncommitted source and test changes. Local
+publication-result JSON files record later publication checkpoints; the checkout's
+HEAD alone does not identify the deployed receiver. Check source and binary
+fingerprints before making a new deployment.

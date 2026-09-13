@@ -24,6 +24,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
+#include "playback_diagnostics.h"
 #define SECOND_IN_NSECS 1000000000UL
 
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
@@ -48,9 +49,34 @@ typedef struct audio_renderer_s {
     GstElement *volume;
     GstBus *bus;
     unsigned char ct;
+    playback_diagnostics_t *diagnostics;
+    screen_status_audio_t screen_baseline;
 } audio_renderer_t ;
 static audio_renderer_t *renderer_type[NFORMATS];
 static audio_renderer_t *renderer = NULL;
+/* RTP delivery runs on a worker while control and bus callbacks can stop or
+ * replace its renderer. Keep the selected renderer valid through every push. */
+static GMutex audio_renderer_lock;
+
+/* Numeric, bounded evidence from the audio path. All fields share the renderer
+ * lock; no sender data or audio payload is included in these messages. */
+static struct {
+    guint64 generation, input, pushed, inactive, invalid_time, invalid_frame, push_errors;
+    gint64 started;
+    gboolean active;
+} audio_trace;
+
+static void audio_trace_summary(const char *stage) {
+    logger_log(logger, LOGGER_INFO, "RAOP audio: generation=%" G_GUINT64_FORMAT
+               " stage=%s elapsed_ms=%" G_GINT64_FORMAT
+               " input=%" G_GUINT64_FORMAT " pushed=%" G_GUINT64_FORMAT
+               " inactive=%" G_GUINT64_FORMAT " invalid_time=%" G_GUINT64_FORMAT
+               " invalid_frame=%" G_GUINT64_FORMAT " push_errors=%" G_GUINT64_FORMAT,
+               audio_trace.generation, stage,
+               audio_trace.started ? (g_get_monotonic_time() - audio_trace.started) / 1000 : 0,
+               audio_trace.input, audio_trace.pushed, audio_trace.inactive,
+               audio_trace.invalid_time, audio_trace.invalid_frame, audio_trace.push_errors);
+}
 
 /* GStreamer Caps strings for Airplay-defined audio compression types (ct) */
 
@@ -126,6 +152,7 @@ bool gstreamer_init(){
 }
 
 void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {
+    g_mutex_lock(&audio_renderer_lock);
     GError *error = NULL;
     GstCaps *caps = NULL;
     GstClock *clock = gst_system_clock_obtain();
@@ -233,24 +260,42 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         logger_log(logger, LOGGER_DEBUG, "GStreamer audio pipeline %d: \"%s\"", i+1, launch->str);
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+        if (screen_status_get_mode() != SCREEN_INFO_OFF) {
+            renderer_type[i]->diagnostics = playback_diagnostics_attach(
+                renderer_type[i]->pipeline, logger, 0, audio_trace.generation + 1);
+            playback_diagnostics_enable_screen(renderer_type[i]->diagnostics, NULL, NULL);
+        }
         gst_caps_unref(caps);
-        g_object_unref(clock);
     }
+    /* Every pipeline owns its own clock reference. Balance our single obtain
+     * once, otherwise repeated renderer teardown consumes those references. */
+    g_object_unref(clock);
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
-void audio_renderer_stop() {
+static void audio_renderer_stop_unlocked(void) {
+    if (audio_trace.active) audio_trace_summary("renderer-stop");
+    audio_trace.active = FALSE;
+    render_audio = FALSE;
     if (renderer) {
         gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
         renderer = NULL;
     }
+    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
+}
+
+void audio_renderer_stop() {
+    g_mutex_lock(&audio_renderer_lock);
+    audio_renderer_stop_unlocked();
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
 static void get_renderer_type(unsigned char *ct, int *id) {
     render_audio = FALSE;
     *id = -1;
     for (int i = 0; i < NFORMATS; i++) {
-        if (renderer_type[i]->ct == *ct) {
+        if (renderer_type[i] && renderer_type[i]->ct == *ct) {
 	    *id = i;
             break;
         }
@@ -283,31 +328,60 @@ static void get_renderer_type(unsigned char *ct, int *id) {
 }
 
 void  audio_renderer_start(unsigned char *ct) {
+    g_mutex_lock(&audio_renderer_lock);
+    if (audio_trace.active) audio_trace_summary("renderer-reconfigure");
+    audio_trace.generation++;
+    audio_trace.input = audio_trace.pushed = audio_trace.inactive = 0;
+    audio_trace.invalid_time = audio_trace.invalid_frame = audio_trace.push_errors = 0;
+    audio_trace.started = g_get_monotonic_time();
+    audio_trace.active = TRUE;
     int id = -1;
     get_renderer_type(ct, &id);
-    if (id >= 0 && renderer) {
-        if(*ct != renderer->ct) {
-            gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
-            gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
-            logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
+    if (id >= 0 && renderer_type[id]->diagnostics) {
+        playback_diagnostics_snapshot_t observed;
+        playback_diagnostics_get_snapshot(renderer_type[id]->diagnostics, &observed);
+        renderer_type[id]->screen_baseline = observed.audio;
+    }
+    if (id >= 0) {
+        if (!renderer || *ct != renderer->ct) {
+            if (renderer) {
+                gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
+                gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+                logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
+            } else {
+                logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
+            }
             renderer = renderer_type[id];
-            gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
-            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+            GstStateChangeReturn result = gst_element_set_state(renderer->pipeline, GST_STATE_PLAYING);
+            if (result == GST_STATE_CHANGE_FAILURE) {
+                /* A failed output cannot remain selected: a later SETUP with
+                 * the same codec would otherwise skip starting it altogether. */
+                logger_log(logger, LOGGER_ERR, "audio pipeline failed to go into playing state");
+                audio_renderer_stop_unlocked();
+            } else {
+                gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+            }
         }
-    } else if (id >= 0) {
-        logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
-        renderer = renderer_type[id];
-        gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
-        gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
     } else {
         logger_log(logger, LOGGER_ERR, "unknown audio compression type ct = %d", *ct);
     }
+    logger_log(logger, LOGGER_INFO, "RAOP audio: generation=%" G_GUINT64_FORMAT
+               " stage=renderer-start ct=%u enabled=%d",
+               audio_trace.generation, (unsigned int)*ct, render_audio && renderer != NULL);
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
 
-    if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+    g_mutex_lock(&audio_renderer_lock);
+    if (!data || !data_len || *data_len <= 0 || !ntp_time)
+        goto done;
+    audio_trace.input++;
+    if (!render_audio || !renderer) {
+        if (++audio_trace.inactive == 1) audio_trace_summary("first-drop-inactive");
+        goto done;
+    }
 
     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
@@ -315,13 +389,10 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         if (pts >= gst_audio_pipeline_base_time) {
             pts -= gst_audio_pipeline_base_time;
         } else {
-            logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_audio_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
-                       ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_audio_pipeline_base_time) / SECOND_IN_NSECS);
-            return;
+            if (++audio_trace.invalid_time == 1) audio_trace_summary("first-drop-invalid-time");
+            goto done;
         }
     }
-    if (data_len == 0 || renderer == NULL) return;
-
     /* all audio received seems to be either ct = 8 (AAC_ELD 44100/2 spf 460 ) AirPlay Mirror protocol *
      * or ct = 2 (ALAC 44100/16/2 spf 352) AirPlay protocol.                                           *
      * first byte data[0] of ALAC frame is 0x20,                                                       *
@@ -364,28 +435,43 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         break;
     }
     if (valid) {
-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        GstFlowReturn result = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        if (result == GST_FLOW_OK) {
+            if (++audio_trace.pushed == 1) audio_trace_summary("first-appsrc-accepted");
+        } else if (++audio_trace.push_errors == 1) {
+            logger_log(logger, LOGGER_WARNING, "RAOP audio: generation=%" G_GUINT64_FORMAT
+                       " stage=first-appsrc-error flow=%d", audio_trace.generation, (int)result);
+        }
     } else {
-        logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
-        logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
+        if (++audio_trace.invalid_frame == 1) audio_trace_summary("first-drop-invalid-frame");
+        gst_buffer_unref(buffer);
     }
+done:
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
 void audio_renderer_set_volume(double volume) {
+    g_mutex_lock(&audio_renderer_lock);
     if (!renderer) {
-       return;
+        g_mutex_unlock(&audio_renderer_lock);
+        return;
     }
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
     g_object_set(renderer->volume, "volume", volume, NULL);
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
 void audio_renderer_flush() {
 }
 
 void audio_renderer_destroy() {
-    audio_renderer_stop();
+    g_mutex_lock(&audio_renderer_lock);
+    audio_renderer_stop_unlocked();
     for (int i = 0; i < NFORMATS ; i++ ) {
+        if (!renderer_type[i]) continue;
+        playback_diagnostics_free(renderer_type[i]->diagnostics);
+        renderer_type[i]->diagnostics = NULL;
         gst_object_unref (renderer_type[i]->bus);
         renderer_type[i]->bus = NULL;
         gst_object_unref (renderer_type[i]->volume);
@@ -395,7 +481,9 @@ void audio_renderer_destroy() {
         gst_object_unref (renderer_type[i]->pipeline);
         renderer_type[i]->pipeline = NULL;
         free(renderer_type[i]);
+        renderer_type[i] = NULL;
     }
+    g_mutex_unlock(&audio_renderer_lock);
 }
 
 static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
@@ -407,12 +495,20 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
         logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
         g_error_free(err);
         g_free(debug);
+        g_mutex_lock(&audio_renderer_lock);
+        /* A queued error may belong to the renderer that was just stopped or
+         * replaced. It must not dereference NULL or stop the new connection. */
+        if (!renderer || renderer->bus != bus) {
+            g_mutex_unlock(&audio_renderer_lock);
+            break;
+        }
         if (renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_bus_set_flushing(bus, TRUE);
         gst_element_set_state (renderer->pipeline, GST_STATE_READY);
         g_main_loop_quit( (GMainLoop *) loop);
+        g_mutex_unlock(&audio_renderer_lock);
 	break;
     }
     case GST_MESSAGE_EOS:
@@ -434,4 +530,26 @@ unsigned int audio_renderer_listen(void *loop, int id) {
     g_assert(id >= 0 && id < NFORMATS);
     return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,(GstBusFunc)
                                             gstreamer_audio_pipeline_bus_callback, (gpointer) loop); 
+}
+
+bool audio_renderer_get_screen_snapshot(screen_status_audio_t *snapshot) {
+    if (!snapshot) return false;
+    memset(snapshot, 0, sizeof(*snapshot));
+    g_mutex_lock(&audio_renderer_lock);
+    gboolean active = render_audio && renderer && audio_trace.active;
+    if (active && renderer->diagnostics) {
+        playback_diagnostics_snapshot_t observed;
+        playback_diagnostics_get_snapshot(renderer->diagnostics, &observed);
+        *snapshot = observed.audio;
+        snapshot->input_buffers -= MIN(snapshot->input_buffers, renderer->screen_baseline.input_buffers);
+        snapshot->decoded_buffers -= MIN(snapshot->decoded_buffers, renderer->screen_baseline.decoded_buffers);
+        snapshot->output_buffers -= MIN(snapshot->output_buffers, renderer->screen_baseline.output_buffers);
+        if (renderer->volume) {
+            g_object_get(renderer->volume, "volume", &snapshot->volume, NULL);
+            snapshot->volume_known = isfinite(snapshot->volume);
+            snapshot->muted = snapshot->volume_known && snapshot->volume == 0.0;
+        }
+    }
+    g_mutex_unlock(&audio_renderer_lock);
+    return active;
 }

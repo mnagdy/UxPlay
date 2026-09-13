@@ -76,6 +76,17 @@ def main():
             try:
                 base = f"http://127.0.0.1:{server.server_port}"
                 uri = f"{base}/master.m3u8"
+                # UHF supplies a direct media playlist rather than YouTube's
+                # cached master. Verify the diagnostic numeric summary on that
+                # real parser path, including its initial media sequence.
+                direct = subprocess.run([binary, f"{base}/video.m3u8", "0"],
+                                        capture_output=True, text=True, timeout=45)
+                if direct.returncode:
+                    raise AssertionError(f"Direct media playlist failed:\n{direct.stdout}\n{direct.stderr}")
+                assert "stage=manifest-summary" in direct.stdout
+                assert "entries=90 variants=0 target_seconds=2 media_sequence=0 endlist=1" in direct.stdout
+                assert "stage=first-media-input" in direct.stdout
+                print("Direct media playlist: playback and numeric manifest diagnostics passed.")
                 for start in (0, 165):
                     subprocess.run([binary, uri, str(start)], check=True, timeout=45)
                 master = (directory / "master.m3u8").read_text(encoding="utf-8")

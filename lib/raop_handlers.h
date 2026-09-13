@@ -621,18 +621,54 @@ raop_handler_setup(raop_conn_t *conn,
     // Parsing bplist
     plist_t req_root_node = NULL;
     plist_from_bin(data, data_len, &req_root_node);
+    if (!PLIST_IS_DICT(req_root_node)) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        plist_free(req_root_node);
+        return;
+    }
     plist_t req_ekey_node = plist_dict_get_item(req_root_node, "ekey");
     plist_t req_eiv_node = plist_dict_get_item(req_root_node, "eiv");
 	
     // For the response
     plist_t res_root_node = plist_new_dict();
 
-    if (PLIST_IS_DATA(req_eiv_node) && PLIST_IS_DATA(req_ekey_node)) {
+    if (req_eiv_node || req_ekey_node) {
         // The first SETUP call that initializes keys and timing
 
         unsigned char aesiv[16] = { 0 };
         unsigned char aeskey[16] = { 0 };
         unsigned char eaeskey[72] = { 0 };
+
+        /* Data node type alone says nothing about its byte length. Validate
+         * both fields before fixed-size copies or transport initialization. */
+        char *eiv = NULL, *ekey = NULL;
+        uint64_t eiv_len = 0, ekey_len = 0;
+        if (PLIST_IS_DATA(req_eiv_node)) plist_get_data_val(req_eiv_node, &eiv, &eiv_len);
+        if (PLIST_IS_DATA(req_ekey_node)) plist_get_data_val(req_ekey_node, &ekey, &ekey_len);
+        if (!eiv || !ekey || eiv_len != sizeof(aesiv) || ekey_len != sizeof(eaeskey)) {
+            logger_log(raop->logger, LOGGER_WARNING, "SETUP rejected: invalid encryption field lengths");
+            free(eiv);
+            free(ekey);
+            plist_free(res_root_node);
+            plist_free(req_root_node);
+            http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+            return;
+        }
+        memcpy(aesiv, eiv, sizeof(aesiv));
+        memcpy(eaeskey, ekey, sizeof(eaeskey));
+        free(eiv);
+        free(ekey);
+
+        /* SETUP 2 uses the existing objects. A repeated SETUP 1 must not
+         * orphan their threads/sockets by overwriting the owning pointers.
+         * Reinitialization requires a fresh control connection. */
+        if (conn->raop_ntp || conn->raop_rtp || conn->raop_rtp_mirror) {
+            logger_log(raop->logger, LOGGER_WARNING, "SETUP rejected: transport session already initialized");
+            plist_free(res_root_node);
+            plist_free(req_root_node);
+            http_response_init(response, "RTSP/1.0", 455, "Method Not Valid in This State");
+            return;
+        }
 
         logger_log(raop->logger, LOGGER_DEBUG, "SETUP 1");
 
@@ -745,8 +781,6 @@ raop_handler_setup(raop_conn_t *conn,
             }
         }
 	
-        char* eiv = NULL;
-        uint64_t eiv_len = 0;
         char *model = NULL;
         char *name = NULL;
         bool admit_client = true;
@@ -779,9 +813,6 @@ raop_handler_setup(raop_conn_t *conn,
             return;
         }
 
-        plist_get_data_val(req_eiv_node, &eiv, &eiv_len);
-        memcpy(aesiv, eiv, 16);
-        free(eiv);	
         logger_log(raop->logger, LOGGER_DEBUG, "eiv_len = %llu", eiv_len);
         if (logger_debug) {
             char* str = utils_data_to_string(aesiv, 16, 16);
@@ -789,11 +820,6 @@ raop_handler_setup(raop_conn_t *conn,
             free(str);
         }
 
-        char* ekey = NULL;
-        uint64_t ekey_len = 0;
-        plist_get_data_val(req_ekey_node, &ekey, &ekey_len);
-        memcpy(eaeskey,ekey,72);
-        free(ekey);
         logger_log(raop->logger, LOGGER_DEBUG, "ekey_len = %llu", ekey_len);
         // eaeskey is 72 bytes, aeskey is 16 bytes
         if (logger_debug) {
@@ -1277,12 +1303,21 @@ raop_handler_teardown(raop_conn_t *conn,
     }
     plist_free(req_root_node);
     logger_log(raop->logger, LOGGER_DEBUG, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
+    logger_log(raop->logger, LOGGER_INFO,
+               "RAOP RTP audio trace rtp_generation=%" PRIu64
+               " event=teardown-request audio=%d video=%d rtp_present=%d",
+               conn->raop_rtp ? raop_rtp_get_trace_generation(conn->raop_rtp) : UINT64_C(0),
+               teardown_96 ? 1 : 0, teardown_110 ? 1 : 0, conn->raop_rtp ? 1 : 0);
   
     http_response_add_header(response, "Connection", "close");
   
     if (teardown_96) {
         if (conn->raop_rtp) {
             /* Stop our audio RTP session */
+            logger_log(raop->logger, LOGGER_INFO,
+                       "RAOP RTP audio trace rtp_generation=%" PRIu64
+                       " event=stop-request reason=sender-teardown-audio",
+                       raop_rtp_get_trace_generation(conn->raop_rtp));
             raop_rtp_stop(conn->raop_rtp);
             /* stop any  coverart rendering */
             if (raop->callbacks.audio_stop_coverart_rendering) {
@@ -1302,6 +1337,10 @@ raop_handler_teardown(raop_conn_t *conn,
     } else {
         /* Destroy our sessions */
         if (conn->raop_rtp) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "RAOP RTP audio trace rtp_generation=%" PRIu64
+                       " event=stop-request reason=sender-teardown-session",
+                       raop_rtp_get_trace_generation(conn->raop_rtp));
             raop_rtp_destroy(conn->raop_rtp);
             conn->raop_rtp = NULL;
         }

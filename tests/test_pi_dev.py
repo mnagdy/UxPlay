@@ -84,6 +84,19 @@ class SourceTests(unittest.TestCase):
             dev.run_workflow(FakePi(), "deploy")
         self.assertEqual(calls, ["prepare", "sync", "build", "finish"])
 
+    def test_mpv_build_is_explicit_and_does_not_activate(self):
+        calls = []
+
+        class FakePi:
+            def remote(self, action, *args, **kwargs):
+                calls.append(action)
+
+            def sync(self, source):
+                calls.append("sync")
+
+        dev.run_workflow(FakePi(), "build", with_mpv=True)
+        self.assertEqual(calls, ["prepare", "sync", "build-mpv", "finish"])
+
     def test_failed_lock_acquisition_does_not_release_another_lock(self):
         calls = []
 

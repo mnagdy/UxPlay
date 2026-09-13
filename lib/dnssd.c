@@ -274,6 +274,10 @@ void
 dnssd_destroy(dnssd_t *dnssd)
 {
     if (dnssd) {
+        dnssd_unregister_raop(dnssd);
+        dnssd_unregister_airplay(dnssd);
+        free(dnssd->name);
+        free(dnssd->hw_addr);
 #ifdef WIN32
         FreeLibrary(dnssd->module);
 #elif USE_LIBDL
@@ -452,10 +456,6 @@ dnssd_unregister_raop(dnssd_t *dnssd)
     dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
     dnssd->raop_service = NULL;
 
-    if (dnssd->airplay_service == NULL) {
-        free(dnssd->name);
-        free(dnssd->hw_addr);
-    }
 }
 
 void
@@ -473,10 +473,6 @@ dnssd_unregister_airplay(dnssd_t *dnssd)
     dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
     dnssd->airplay_service = NULL;
 
-    if (dnssd->raop_service == NULL) {
-        free(dnssd->name);
-        free(dnssd->hw_addr);
-    }
 }
 
 uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {

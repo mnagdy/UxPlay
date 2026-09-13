@@ -1,0 +1,86 @@
+Subject: [LOCAL TEST REFERENCE] include the pinned Raspberry Pi FFmpeg formats
+
+This is a platform-specific golden-reference adaptation, not an upstream mpv
+code change. mpv 0.40.0 selects test/ref/ffmpeg7 by libavutil's numeric version;
+Raspberry Pi's libavutil 59.39.100 also exposes five downstream formats which
+are absent from that upstream reference. Its libavutil/pixfmt.h declares
+AVUTIL_HAVE_PIX_FMT_SAND and AV_PIX_FMT_SAND128, AV_PIX_FMT_SAND64_10,
+AV_PIX_FMT_SAND64_16, AV_PIX_FMT_RPI4_8 and AV_PIX_FMT_RPI4_10 (lines 442-449).
+
+Provenance: native arm64 libavutil-dev 8:7.1.5-0+deb13u1+rpt2, downloaded using
+authenticated APT metadata from archive.raspberrypi.com/debian/pool/main/f/ffmpeg/
+libavutil-dev_7.1.5-0%2bdeb13u1%2brpt2_arm64.deb.
+Package SHA256: 76f0554065a40cb80929184b5c46a6a34bba106ad21480220a10dd9f1373de66
+
+The native img-format test reached its final reference comparison and aborted
+because of exactly this 49-line insertion. All original reference bytes remain
+unchanged. The expected additions were reviewed against the matching Pi headers
+and generated descriptor output; they must not be generalized to ignore unknown
+formats or other differences. Preserve the original failed-test log and rerun
+the full suite normally after applying this patch. No failure is suppressed.
+
+Original reference SHA256:
+6792534b28449a0e8dfd4cf4d19fd30b1c420d8d8490181108018e4e95bdb878
+Adapted reference SHA256:
+7d8fa93416ee8d1ed6124e6b9c9a1701e50e7dc0b08fedbdb3230c966426127b
+Inserted 1591-byte block SHA256:
+89dbac620234589b6791cdc0c624e3b82a53db9ef12083f90407a6d4f148e066
+
+--- a/test/ref/ffmpeg7/img_formats.txt
++++ b/test/ref/ffmpeg7/img_formats.txt
+@@ -1449,6 +1449,55 @@
+     0: p=0  st=12 o=0  sh=0  d=32
+     1: p=0  st=12 o=4  sh=0  d=32
+     2: p=0  st=12 o=8  sh=0  d=32
++rpi4_10: [GENERIC] ctype=unknown
++  Basic desc: [le][be][hw]
++    planes=0, chroma=0:0 align=1:1
++    {}
++  AVD: name=rpi4_10 chroma=0:0 flags=0x8 [hw]
++rpi4_8: [GENERIC] ctype=unknown
++  Basic desc: [le][be][hw]
++    planes=0, chroma=0:0 align=1:1
++    {}
++  AVD: name=rpi4_8 chroma=0:0 flags=0x8 [hw]
++sand128: [GENERIC] ctype=uint
++  Basic desc: [ba][bb][nv][yuv][le][be][uint]
++    planes=2, chroma=1:1 align=2:2
++    {8/[0:0] 16/[1:1] }
++    0: 8bits {0:8} {} {} {}
++    1: 16bits {} {0:8} {8:8} {}
++  Regular: planes=2 compbytes=1 bitpad=0 chroma=2x2 ctype=uint
++    0: {1}
++    1: {2, 3}
++  AVD: name=sand128 chroma=1:1 flags=0x0
++    0: p=0  st=1  o=0  sh=0  d=8
++    1: p=1  st=2  o=0  sh=0  d=8
++    2: p=1  st=2  o=1  sh=0  d=8
++sand64_10: [GENERIC] ctype=uint
++  Basic desc: [ba][bb][nv][yuv][le][uint]
++    planes=2, chroma=1:1 align=2:2
++    {16/[0:0] 32/[1:1] }
++    0: 16bits {0:16/-6} {} {} {}
++    1: 32bits {} {0:16/-6} {16:16/-6} {}
++  Regular: planes=2 compbytes=2 bitpad=-6 chroma=2x2 ctype=uint
++    0: {1}
++    1: {2, 3}
++  AVD: name=sand64_10 chroma=1:1 flags=0x0
++    0: p=0  st=2  o=0  sh=0  d=10
++    1: p=1  st=4  o=0  sh=0  d=10
++    2: p=1  st=4  o=2  sh=0  d=10
++sand64_16: [GENERIC] ctype=uint
++  Basic desc: [ba][bb][nv][yuv][le][uint]
++    planes=2, chroma=1:1 align=2:2
++    {16/[0:0] 32/[1:1] }
++    0: 16bits {0:16} {} {} {}
++    1: 32bits {} {0:16} {16:16} {}
++  Regular: planes=2 compbytes=2 bitpad=0 chroma=2x2 ctype=uint
++    0: {1}
++    1: {2, 3}
++  AVD: name=sand64_16 chroma=1:1 flags=0x0
++    0: p=0  st=2  o=0  sh=0  d=16
++    1: p=1  st=4  o=0  sh=0  d=16
++    2: p=1  st=4  o=2  sh=0  d=16
+ uyvy422: ctype=uint
+   Basic desc: [ba][yuv][le][be][uint]
+     planes=1, chroma=1:0 align=2:1

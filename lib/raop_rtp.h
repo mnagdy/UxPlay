@@ -43,6 +43,7 @@ void raop_rtp_set_progress(raop_rtp_t *raop_rtp, uint32_t start, uint32_t curr, 
 void raop_rtp_flush(raop_rtp_t *raop_rtp, int next_seq);
 void raop_rtp_stop(raop_rtp_t *raop_rtp);
 int raop_rtp_is_running(raop_rtp_t *raop_rtp);
+uint64_t raop_rtp_get_trace_generation(raop_rtp_t *raop_rtp);
 void raop_rtp_destroy(raop_rtp_t *raop_rtp);
 
 #endif

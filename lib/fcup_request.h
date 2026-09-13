@@ -74,7 +74,27 @@ int fcup_request(void *conn_opaque, const char *media_url, const char *client_se
     int datalen = 0;
     int requestlen = 0;
 
-    int socket_fd = httpd_get_connection_socket_by_type(raop->httpd, CONNECTION_TYPE_PTTH, 1);
+    int socket_fd = -1;
+    if (raop->hls_scoped_cache) {
+        uint64_t newest = 0;
+        /* The first reverse socket can belong to a sender being replaced.
+         * Match the requested session without changing another sender's
+         * connection type or sending its media location to that sender. */
+        for (int instance = 1; ; instance++) {
+            raop_conn_t *reverse = httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_PTTH, instance);
+            if (!reverse) break;
+            if (reverse->client_session_id && client_session_id &&
+                !strcmp(reverse->client_session_id, client_session_id) &&
+                reverse->reverse_registration_order >= newest) {
+                socket_fd = httpd_get_connection_socket(raop->httpd, reverse);
+                newest = reverse->reverse_registration_order;
+            }
+        }
+        if (socket_fd < 0 || request_id <= 0) {
+            logger_log(raop->logger, LOGGER_WARNING, "FCUP request unavailable: no current reverse connection or request ID");
+            return -1;
+        }
+    } else socket_fd = httpd_get_connection_socket_by_type(raop->httpd, CONNECTION_TYPE_PTTH, 1);
     
     logger_log(raop->logger, LOGGER_DEBUG, "fcup_request send socket = %d", socket_fd);
     
@@ -91,17 +111,31 @@ int fcup_request(void *conn_opaque, const char *media_url, const char *client_se
     free(plist_xml);
 
     const char *http_request = http_response_get_data(request, &requestlen); 
-    int send_len = send(socket_fd, http_request, requestlen, 0);
-    if (send_len < 0) {
+    int send_flags = 0;
+    if (raop->hls_scoped_cache) {
+#ifdef MSG_DONTWAIT
+        send_flags |= MSG_DONTWAIT;
+#endif
+#ifdef MSG_NOSIGNAL
+        send_flags |= MSG_NOSIGNAL;
+#endif
+    }
+    int send_len = send(socket_fd, http_request, requestlen, send_flags);
+    if (send_len < 0 || (raop->hls_scoped_cache && send_len != requestlen)) {
         int sock_err = SOCKET_GET_ERROR();
 	logger_log(raop->logger, LOGGER_ERR, "fcup_request: send  error %d:%s\n",
 		 sock_err, SOCKET_ERROR_STRING(sock_err));
 	http_response_destroy(request);
+        /* An incomplete reverse HTTP request cannot safely be reused. Do not
+         * wait on a blocked sender from the protocol dispatcher. */
+#ifdef SHUT_RDWR
+        if (raop->hls_scoped_cache) shutdown(socket_fd, SHUT_RDWR);
+#endif
         /* shut down connection? */
         return -1;
     }
 
-    if (logger_get_level(raop->logger) >= LOGGER_DEBUG) {
+    if (!raop->hls_scoped_cache && logger_get_level(raop->logger) >= LOGGER_DEBUG) {
       char *request_str =  utils_data_to_text(http_request, requestlen);
         logger_log(raop->logger, LOGGER_DEBUG, "\n%s", request_str);
         free (request_str);

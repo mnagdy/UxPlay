@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Activate a prepared Pi release and install its SSH debug helper."""
+from pathlib import Path
+import importlib.util
+import subprocess
+import uuid
+
+
+def main():
+    release = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location('pi_remote', release / 'pi_remote.py')
+    remote = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(remote)
+    subprocess.run(['sudo', '-v'], check=True)
+    token = uuid.uuid4().hex
+    remote.main(['prepare', token])
+    try:
+        remote.main(['activate', token, release.name])
+        remote.sudo('install', '-m', '0755', '--', release / 'tv-debug', '/usr/local/bin/tv-debug')
+        subprocess.run(['/usr/local/bin/tv-debug', 'status'], check=True)
+        print('Ready: tv-debug on / tv-debug off / tv-debug status')
+    finally:
+        remote.main(['finish', token])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        raise SystemExit(str(error))

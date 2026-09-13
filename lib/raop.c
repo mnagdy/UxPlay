@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <inttypes.h>
+#include <limits.h>
 
 #include "raop.h"
 #include "raop_rtp.h"
@@ -88,6 +90,10 @@ struct raop_s {
     /* activate support for HLS live streaming */
     bool hls_support;
     bool hls_pi4;
+    bool hls_mpv;
+    bool hls_scoped_cache;
+    int scoped_fcup_request_id;
+    uint64_t reverse_registration_order;
     bool hls_pending;
   
     /* used in digest authentication */
@@ -118,6 +124,7 @@ struct raop_conn_s {
     connection_type_t connection_type; 
 
     char *client_session_id;
+    uint64_t reverse_registration_order;
     bool authenticated;
     bool have_active_remote;
 };
@@ -268,6 +275,23 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *host = http_request_get_header(request, "Host");
     hls_request =  (host && !cseq && !client_session_id);
 
+    /* Reject stale direct-video controls before classifying a fresh AirPlay
+     * connection: that classification can otherwise stop RAOP services. */
+    if (raop->hls_scoped_cache && !cseq &&
+        (!strcmp(url, "/stop") || !strcmp(url, "/playback-info") ||
+         !strcmp(url, "/rate") || !strncmp(url, "/rate?", 6) ||
+         !strcmp(url, "/scrub") || !strncmp(url, "/scrub?", 7) ||
+         !strcmp(url, "/action") || !strncmp(url, "/setProperty?", 13))) {
+        http_response_t *guard = http_response_create();
+        http_response_init(guard, "HTTP/1.1", 200, "OK");
+        if (!http_video_control_is_current(conn, request, guard)) {
+            http_response_finish(guard, NULL, 0);
+            *response = guard;
+            return;
+        }
+        http_response_destroy(guard);
+    }
+
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq || ble) {
             if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP)) {
@@ -310,11 +334,15 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 if (raop_rtp) {
                     logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping RAOP audio"
                                " service on RAOP connection %p", raop_conn);
+                    logger_log(raop->logger, LOGGER_INFO,
+                               "RAOP RTP audio trace rtp_generation=%" PRIu64
+                               " event=stop-request reason=new-airplay-connection",
+                               raop_rtp_get_trace_generation(raop_rtp));
                     raop_rtp_stop(raop_rtp);
                 }
 
                 raop_ntp_t *raop_ntp = raop_conn->raop_ntp;
-                if (raop_rtp) {
+                if (raop_ntp) {
                     logger_log(raop->logger, LOGGER_DEBUG, "New AirPlay connection: stopping NTP time"
                                " service on RAOP connection %p", raop_conn);
                     raop_ntp_stop(raop_ntp);
@@ -556,6 +584,10 @@ conn_destroy(void *ptr) {
 
     if (conn->raop_rtp) {
         /* This is done in case TEARDOWN was not called */
+        logger_log(raop->logger, LOGGER_INFO,
+                   "RAOP RTP audio trace rtp_generation=%" PRIu64
+                   " event=stop-request reason=connection-destroy",
+                   raop_rtp_get_trace_generation(conn->raop_rtp));
         raop_rtp_destroy(conn->raop_rtp);
     }
     if (conn->raop_rtp_mirror) {
@@ -566,7 +598,9 @@ conn_destroy(void *ptr) {
         raop_ntp_destroy(conn->raop_ntp);
     }
 
-    if (raop->callbacks.video_flush) {
+    /* Cache/control sockets do not own the mirrored video pipeline. Closing
+     * one must not flush a newer mirroring session on another connection. */
+    if (conn->raop_rtp_mirror && raop->callbacks.video_flush) {
         raop->callbacks.video_flush(raop->callbacks.cls);
     }
 
@@ -769,10 +803,19 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
         raop->hls_support = (value > 0 ? true : false);
     } else if (strcmp(plist_item, "hls_pi4") == 0) {
         raop->hls_pi4 = (value > 0);
+    } else if (strcmp(plist_item, "hls_scoped_cache") == 0) {
+        raop->hls_scoped_cache = (value > 0);
+    } else if (strcmp(plist_item, "hls_mpv") == 0) {
+        raop->hls_mpv = (value > 0);
     } else {
         retval = -1;
     }	  
     return retval;
+}
+
+int raop_next_scoped_fcup_request_id(raop_t *raop) {
+    if (!raop || raop->scoped_fcup_request_id == INT_MAX) return 0;
+    return ++raop->scoped_fcup_request_id;
 }
 
 void

@@ -31,6 +31,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include "../lib/logger.h"
+#include "screen_status.h"
 
 bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync, const char *artp_pipeline);
@@ -41,6 +42,10 @@ void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();
 void audio_renderer_destroy();
 unsigned int audio_renderer_listen(void *loop, int id);
+/* Read-only evidence from the active RAOP pipeline. Counts exclude previous
+ * connections; a true return means an active renderer, not audible playback.
+ * Output samples must be nonzero to claim observed audio progress. */
+bool audio_renderer_get_screen_snapshot(screen_status_audio_t *snapshot);
 #ifdef __cplusplus
 }
 #endif

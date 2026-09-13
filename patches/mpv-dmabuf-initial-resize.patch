@@ -1,0 +1,27 @@
+From 43ce03c519f6ca7e61c73616d4aa10ecb4a380d2 Mon Sep 17 00:00:00 2001
+From: Dudemanguy <random342@airmail.cc>
+Date: Tue, 8 Apr 2025 09:18:25 -0500
+Subject: [PATCH] vo_dmabuf_wayland: don't resize if dst rect is 0
+
+Evidently it is possible for some compositors to trigger an external
+resize before the very first initial reconfig. This can't work and will
+fail in various ways. Check this case and bail out. Fixes #16202.
+---
+ video/out/vo_dmabuf_wayland.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/video/out/vo_dmabuf_wayland.c b/video/out/vo_dmabuf_wayland.c
+index 3cb034d5c7d08..d33bed425f01d 100644
+--- a/video/out/vo_dmabuf_wayland.c
++++ b/video/out/vo_dmabuf_wayland.c
+@@ -517,8 +517,9 @@ static void resize(struct vo *vo)
+ 
+     const int width = mp_rect_w(wl->geometry);
+     const int height = mp_rect_h(wl->geometry);
++    vo_get_src_dst_rects(vo, &src, &dst, &p->screen_osd_res);
+ 
+-    if (width == 0 || height == 0)
++    if (width == 0 || height == 0 || mp_rect_w(dst) == 0 || mp_rect_h(dst) == 0)
+         return;
+ 
+     vo_wayland_set_opaque_region(wl, false);

@@ -1,0 +1,25 @@
+From: PiPlay display prototype
+Subject: [EXPERIMENTAL] Add P030 format metadata to Weston 14.0.2
+
+Adapt the P030 plane/subsampling metadata present in upstream Weston 16.0.0
+libweston/pixel-formats.c (Debian source 16.0.0-1, lines 806-812) to the
+Weston 14 sampler representation. This only removes known format-lookup
+rejections; it does not establish Pi modifier import or direct scanout.
+Source: https://sources.debian.org/data/main/w/weston/16.0.0-1/libweston/pixel-formats.c
+
+--- a/libweston/pixel-formats.c
++++ b/libweston/pixel-formats.c
+@@ -551,6 +551,13 @@
+ 		.vsub = 2,
+ 	},
+ 	{
++		DRM_FORMAT(P030),
++		SAMPLER_TYPE(EGL_TEXTURE_Y_UV_WL),
++		.num_planes = 2,
++		.hsub = 2,
++		.vsub = 2,
++	},
++	{
+ 		DRM_FORMAT(YUV410),
+ 		SAMPLER_TYPE(EGL_TEXTURE_Y_U_V_WL),
+ 		.num_planes = 3,

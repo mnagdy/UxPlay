@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Install the qualified PiPlay display stack into the existing receiver service.
+
+prepare/check need no sudo. install and rollback are bounded transactions.
+Only the root-owned installed launcher and private seat broker run as root;
+Weston, the receiver and capability probes run as the original account.
+"""
+import argparse
+from collections import deque
+from datetime import datetime, timezone
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+HERE = Path(__file__).resolve().parent
+loader = importlib.machinery.SourceFileLoader("piplay_display_trial", str(HERE / "pi-display-trial"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+trial = importlib.util.module_from_spec(spec)
+loader.exec_module(trial)
+Failure = trial.Failure
+STORE = Path("/opt/piplay/display/releases")
+DROPIN = Path("/etc/systemd/system/uxplay.service.d/95-piplay-display.conf")
+RUNTIME = Path("/run/piplay-display")
+WORK = Path("/var/cache/piplay-display")
+SCHEMA = "piplay-display-service-v1"
+PAYLOAD = ("pi-display-service", "pi-display-trial", "trial.json", "receiver.conf", "seatd")
+SAFE_PATH = re.compile(r"/[A-Za-z0-9_./-]+")
+
+
+def write_json(path, value, mode=0o600):
+    data = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    trial.write_private(path, data)
+    path.chmod(mode)
+
+
+def atomic_json(path, value):
+    temporary = path.with_name(path.name + ".new")
+    write_json(temporary, value)
+    os.replace(temporary, path)
+
+
+def command(argv, timeout=60):
+    result = subprocess.run(list(map(str, argv)), env=trial.SAFE_ENV,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, timeout=timeout)
+    if result.returncode:
+        # Avoid printing device configuration or receiver arguments in errors.
+        raise Failure("System operation failed: " + str(argv[0]) + " (" + str(result.returncode) + ")")
+    return result.stdout
+
+
+def systemctl(*args, timeout=60):
+    return command([trial.system_tool("systemctl"), *args], timeout=timeout)
+
+
+def properties():
+    names = ("LoadState,User,ExecStart,ActiveState,SubState,MainPID,NRestarts,"
+             "FragmentPath,DropInPaths,ExecStartPre,ExecStartPost,ExecStop,ExecStopPost")
+    return dict(line.split("=", 1) for line in systemctl("show", trial.SERVICE, "--property=" + names).splitlines()
+                if "=" in line)
+
+
+def baseline_snapshot(user):
+    state = properties()
+    if state.get("LoadState") != "loaded" or state.get("User") != user:
+        raise Failure("The original receiver service must be loaded and use the prepared account.")
+    if any(state.get(key) for key in ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost")):
+        raise Failure("Custom receiver service hooks need explicit integration; no service changed.")
+    match = re.fullmatch(r"\{ path=(\S+) ; argv\[\]=(.*?) ; ignore_errors=no ; [^{}]*\}", state.get("ExecStart", ""))
+    argv = shlex.split(match.group(2)) if match else []
+    if len(argv) != 3 or argv[1] != "-rc" or match.group(1) != argv[0] or any(
+            not SAFE_PATH.fullmatch(p) for p in (argv[0], argv[2])):
+        raise Failure("Expected the original receiver's absolute binary -rc absolute config command.")
+    paths = [state["FragmentPath"], *shlex.split(state["DropInPaths"])]
+    if str(DROPIN) in paths or DROPIN.exists() or DROPIN.is_symlink():
+        raise Failure("A PiPlay override already exists; use its installed rollback command first.")
+    return {"user": user, "command": argv,
+            "units": {str(trial.regular(p)): trial.digest(p) for p in paths},
+            "binary_sha256": trial.digest(trial.regular(argv[0], True)),
+            "config_sha256": trial.digest(trial.regular(argv[2]))}
+
+
+def verify_baseline_files(baseline):
+    for path, expected in baseline["units"].items():
+        if trial.digest(trial.regular(path)) != expected:
+            raise Failure("An original service file changed; leave the display setup intact for manual review.")
+    for path, key in ((baseline["command"][0], "binary_sha256"), (baseline["command"][2], "config_sha256")):
+        if trial.digest(trial.regular(path)) != baseline[key]:
+            raise Failure("The rollback receiver or configuration changed.")
+
+
+def require_root_tree(path):
+    for part in (path, *path.parents):
+        info = part.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Failure("Installed launchers and their parents must be root-owned and not writable by other accounts.")
+
+
+def executable_filesystem(path):
+    existing = path
+    while not existing.exists():
+        existing = existing.parent
+    if os.statvfs(existing).f_flag & os.ST_NOEXEC:
+        raise Failure("The display plugin and seat broker need an executable filesystem: " + str(path))
+
+
+def cleanup_work():
+    require_root_tree(WORK)
+    # The service owns this namespace. Its display lock and systemd's cgroup
+    # cleanup prevent old children from surviving into this startup. rmtree
+    # does not follow symlinks inside the receiver-owned runtime subdirectory.
+    for path in WORK.iterdir():
+        if path.name.startswith("piplay-trial-"):
+            require_root_tree(path)
+            if not path.is_dir():
+                raise Failure("Unexpected file in the display workspace.")
+            shutil.rmtree(path)
+
+
+def unit_text(directory):
+    directory = str(directory)
+    if not SAFE_PATH.fullmatch(directory):
+        raise Failure("Unsupported installation path.")
+    launcher = "/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 /usr/bin/python3 -I " + directory + "/pi-display-service"
+    return ("# Managed by PiPlay pi-display-service. Roll back using the installed launcher.\n"
+            "[Unit]\nStartLimitIntervalSec=60\nStartLimitBurst=3\n"
+            "[Service]\nType=simple\nUser=root\nGroup=root\nSupplementaryGroups=\n"
+            "WorkingDirectory=/\nEnvironment=\nEnvironmentFile=\nPassEnvironment=\n"
+            "ExecStart=\nExecStart=" + launcher + " serve " + directory + "\n"
+            "ExecStopPost=\nExecStopPost=" + launcher + " restore-wifi\n"
+            "Restart=always\nRestartSec=3\nKillMode=mixed\nTimeoutStopSec=25\n"
+            "RuntimeDirectory=piplay-display\nRuntimeDirectoryMode=0711\n"
+            "CacheDirectory=piplay-display\nCacheDirectoryMode=0711\n"
+            "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=piplay-display\n")
+
+
+def prepare(args):
+    executable_filesystem(WORK)
+    plan = trial.load_plan(args.trial)
+    trial.preflight(plan)
+    baseline = baseline_snapshot(plan["user"])
+    if args.wifi_interface and not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", args.wifi_interface):
+        raise Failure("Invalid Wi-Fi interface.")
+    if args.wifi_interface:
+        wifi_state(args.wifi_interface)  # Read only; fail preparation if unsupported.
+    target = Path(args.output).absolute()
+    target.mkdir(mode=0o700)
+    data = {"pi-display-service": Path(__file__).read_bytes(), "pi-display-trial": (HERE / "pi-display-trial").read_bytes(),
+            "trial.json": (Path(args.trial) / "trial.json").read_bytes(),
+            "receiver.conf": Path(plan["config_path"]).read_bytes(), "seatd": Path(plan["files"]["seatd"]["path"]).read_bytes()}
+    for name, value in data.items():
+        (target / name).write_bytes(value)
+        (target / name).chmod(0o700 if name == "seatd" else 0o600)
+    metadata = {"schema": SCHEMA, "baseline": baseline, "wifi_interface": args.wifi_interface,
+                "files": {name: hashlib.sha256(value).hexdigest() for name, value in data.items()}}
+    identifier = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + metadata["files"]["pi-display-service"][:12]
+    metadata["installation"] = str(STORE / identifier)
+    write_json(target / "service.json", metadata)
+    trial.write_private(target / "95-piplay-display.conf", unit_text(metadata["installation"]))
+    print("Prepared " + str(target) + ". The running receiver and Wi-Fi are unchanged.")
+
+
+def read_bundle(directory, installed=False, load_runtime=True):
+    directory = trial.regular(Path(directory) / "service.json").parent
+    if installed:
+        require_root_tree(directory)
+        for name in (*PAYLOAD, "service.json"):
+            require_root_tree(directory / name)
+    metadata = json.loads((directory / "service.json").read_text())
+    if metadata.get("schema") != SCHEMA or set(metadata.get("files", {})) != set(PAYLOAD):
+        raise Failure("Invalid display installation manifest.")
+    install_path = Path(metadata["installation"])
+    if install_path.parent != STORE or not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{12}", install_path.name):
+        raise Failure("Invalid display installation destination.")
+    if installed and directory != install_path:
+        raise Failure("Installed package has moved.")
+    for name, expected in metadata["files"].items():
+        if trial.digest(trial.regular(directory / name)) != expected:
+            raise Failure("A display installation file changed: " + name)
+    interface = metadata.get("wifi_interface")
+    if interface is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", interface):
+        raise Failure("Invalid installed Wi-Fi interface.")
+    if not load_runtime:
+        # Rollback must still work if a candidate binary/library disappeared.
+        return metadata, None
+    plan = trial.load_plan(directory, installed=installed)
+    if metadata["baseline"]["user"] != plan["user"]:
+        raise Failure("Rollback account differs from the receiver account.")
+    if trial.digest(directory / "seatd") != plan["files"]["seatd"]["sha256"]:
+        raise Failure("The private seat broker differs from the qualified binary.")
+    return metadata, plan
+
+
+def seal_bundle(source, metadata, plan):
+    target = Path(metadata["installation"])
+    STORE.mkdir(mode=0o755, parents=True, exist_ok=True)
+    require_root_tree(STORE)
+    if target.exists():
+        previous, _ = read_bundle(target, installed=True)
+        if previous["baseline"] != metadata["baseline"] or previous["source_files"] != metadata["files"]:
+            raise Failure("The existing installation differs; prepare a fresh package.")
+        return target
+    target.mkdir(mode=0o750)
+    os.chown(target, 0, plan["gid"])
+    for name, expected in metadata["files"].items():
+        value = trial.regular(source / name).read_bytes()
+        if hashlib.sha256(value).hexdigest() != expected:
+            raise Failure("Installation source changed while being copied.")
+        path = target / name
+        path.write_bytes(value)
+        os.chown(path, 0, plan["gid"])
+        path.chmod(0o750 if name == "seatd" else 0o640)
+    installed_plan = json.loads((target / "trial.json").read_text())
+    installed_plan["files"]["seatd"]["path"] = str(target / "seatd")
+    (target / "trial.json").write_text(json.dumps(installed_plan, indent=2) + "\n")
+    sealed = dict(metadata, source_files=metadata["files"], files={name: trial.digest(target / name) for name in PAYLOAD})
+    write_json(target / "service.json", sealed, mode=0o640)
+    os.chown(target / "service.json", 0, plan["gid"])
+    read_bundle(target, installed=True)
+    return target
+
+
+def stop_service():
+    systemctl("stop", trial.SERVICE)
+    state = properties()
+    if state.get("MainPID") != "0" or state.get("ActiveState") not in ("inactive", "failed"):
+        raise trial.RecoveryRequired("The display service did not stop; refusing to start a competing receiver.")
+
+
+def baseline_health(baseline, seconds=5):
+    first = None
+    deadline = time.monotonic() + seconds
+    while True:
+        state = properties()
+        pid = state.get("MainPID", "0")
+        current = (pid, state.get("NRestarts"))
+        if state.get("ActiveState") != "active" or state.get("SubState") != "running" or pid == "0":
+            raise Failure("The original receiver did not return to running state.")
+        if os.readlink("/proc/" + pid + "/exe") != baseline["command"][0]:
+            raise Failure("An unexpected receiver was started during rollback.")
+        argv = Path("/proc", pid, "cmdline").read_bytes().rstrip(b"\0").decode().split("\0")
+        if argv != baseline["command"] or (first is not None and current != first):
+            raise Failure("The original receiver command changed or restarted during rollback.")
+        first = current
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.25)
+
+
+def display_health(directory, seconds=5, timeout=50):
+    deadline, stable_since, first = time.monotonic() + timeout, None, None
+    while time.monotonic() < deadline:
+        state = properties()
+        try:
+            health = json.loads((RUNTIME / "health.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            health = {}
+        current = (state.get("MainPID"), state.get("NRestarts"), health.get("receiver_pid"), health.get("weston_pid"))
+        valid = (state.get("ActiveState") == "active" and str(health.get("supervisor_pid")) == state.get("MainPID")
+                 and health.get("installation") == str(directory)
+                 and time.monotonic() - health.get("monotonic", 0) < 3)
+        if valid:
+            if current != first:
+                first, stable_since = current, time.monotonic()
+            if time.monotonic() - stable_since >= seconds:
+                return
+        else:
+            stable_since, first = None, None
+        time.sleep(0.25)
+    raise Failure("The display service did not remain healthy during activation.")
+
+
+def put_override(text):
+    DROPIN.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    require_root_tree(DROPIN.parent)
+    temporary = DROPIN.with_name(".95-piplay-display.new")
+    trial.write_private(temporary, text)
+    temporary.chmod(0o644)
+    os.replace(temporary, DROPIN)
+
+
+def remove_override(expected):
+    require_root_tree(DROPIN)
+    if DROPIN.read_text() != expected:
+        raise Failure("The PiPlay override was changed; refusing to remove it.")
+    DROPIN.unlink()
+
+
+def activation_transaction(directory, baseline):
+    expected = unit_text(directory)
+    changed = False
+    try:
+        with trial.trial_lock():
+            if DROPIN.exists() or DROPIN.is_symlink():
+                raise Failure("A display override appeared before activation; it was left unchanged.")
+            # Set before writing: even an uncertain result must enter cleanup.
+            changed = True
+            put_override(expected)
+            systemctl("daemon-reload")
+            stop_service()
+        # The service supervisor acquires the display lock for its lifetime.
+        systemctl("reset-failed", trial.SERVICE)
+        systemctl("start", trial.SERVICE)
+        display_health(directory)
+    except BaseException:
+        if changed:
+            print("Activation failed; stopping all display children before restoring the original receiver.", flush=True)
+            stop_service()  # Failure here intentionally leaves the override in place.
+            verify_baseline_files(baseline)
+            if DROPIN.exists():
+                remove_override(expected)
+            systemctl("daemon-reload")
+            systemctl("reset-failed", trial.SERVICE)
+            systemctl("start", trial.SERVICE)
+            baseline_health(baseline)
+            print("Original receiver restored and verified.", flush=True)
+        raise
+
+
+def install(directory):
+    source = Path(directory).absolute()
+    metadata, plan = read_bundle(source)
+    trial.preflight(plan)
+    # Sudo detaches from an accidental SSH hangup while completing rollback.
+    with trial.trial_lock("/run/piplay-display-install.lock"):
+        executable_filesystem(WORK)
+        if baseline_snapshot(plan["user"]) != metadata["baseline"]:
+            raise Failure("The original service changed since preparation; prepare again.")
+        target = seal_bundle(source, metadata, plan)
+        _, sealed_plan = read_bundle(target, installed=True)
+        trial.preflight(sealed_plan)
+        if baseline_snapshot(plan["user"]) != metadata["baseline"]:
+            raise Failure("The original service changed during preflight; prepare again.")
+        activation_transaction(target, metadata["baseline"])
+    print("Display service active. Reboot and physical playback still require observation.")
+    print("Rollback: sudo python3 " + str(target / "pi-display-service") + " rollback")
+
+
+def rollback(directory):
+    metadata, _ = read_bundle(directory, installed=True, load_runtime=False)
+    verify_baseline_files(metadata["baseline"])
+    expected = unit_text(directory)
+    if DROPIN.read_text() != expected:
+        raise Failure("This package is not the selected display service.")
+    with trial.trial_lock("/run/piplay-display-install.lock"):
+        # Do not take the trial lock until the running supervisor has released it.
+        stop_service()
+        with trial.trial_lock():
+            remove_override(expected)
+            systemctl("daemon-reload")
+            systemctl("reset-failed", trial.SERVICE)
+            systemctl("start", trial.SERVICE)
+            baseline_health(metadata["baseline"])
+    print("Original receiver restored and verified. Original Wi-Fi setting restored by the service stop hook.")
+
+
+def wifi_state(interface):
+    text = command([trial.system_tool("iw"), "dev", interface, "get", "power_save"])
+    match = re.fullmatch(r"\s*Power save: (on|off)\s*", text)
+    if not match:
+        raise Failure("Cannot read the current Wi-Fi power-saving setting.")
+    return match.group(1)
+
+
+def set_wifi(interface, state):
+    command([trial.system_tool("iw"), "dev", interface, "set", "power_save", state])
+    if wifi_state(interface) != state:
+        raise Failure("Wi-Fi power-saving change could not be verified.")
+
+
+def begin_wifi(interface):
+    if not interface:
+        return
+    receipt = RUNTIME / "wifi.json"
+    if receipt.exists():
+        raise Failure("A previous Wi-Fi restoration is pending.")
+    # Record before mutation so the systemd stop hook can recover after SIGKILL.
+    write_json(receipt, {"interface": interface, "original": wifi_state(interface)})
+    set_wifi(interface, "off")
+    print("Wi-Fi power saving off for the display service lifetime.", flush=True)
+
+
+def restore_wifi():
+    receipt = RUNTIME / "wifi.json"
+    if not receipt.exists():
+        return
+    require_root_tree(receipt)
+    state = json.loads(receipt.read_text())
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", state.get("interface", "")) or state.get("original") not in ("on", "off"):
+        raise Failure("Invalid Wi-Fi restoration receipt.")
+    set_wifi(state["interface"], state["original"])
+    receipt.unlink()
+    print("Original Wi-Fi power-saving setting restored and verified.", flush=True)
+
+
+class ServiceHost(trial.Host):
+    def __init__(self, plan):
+        super().__init__(plan, root_parent=str(WORK))
+        self.receiver = None
+
+    def launch(self, label, arguments, environment=None, cwd=None):
+        # All child output goes to systemd's bounded journal, never the console.
+        process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL,
+                                   env=environment or trial.SAFE_ENV, cwd=cwd, start_new_session=True)
+        self.processes.append(process)
+        return process
+
+    def start_receiver(self):
+        super().start_receiver()
+        self.receiver = self.processes[-1]
+
+    def monitor_service(self, directory):
+        restarts = deque()
+        next_health = 0
+        while True:
+            if any(process.poll() is not None for process in self.processes[:2]):
+                raise Failure("Display owner or seat broker exited; restarting the complete service.")
+            if self.receiver.poll() is not None:
+                # Reap the whole receiver/player group before opening audio again.
+                trial.terminate_group(self.receiver)
+                self.processes.remove(self.receiver)
+                now = time.monotonic()
+                while restarts and now - restarts[0] > 60:
+                    restarts.popleft()
+                if len(restarts) >= 3:
+                    raise Failure("Receiver repeatedly failed; restarting the complete service.")
+                restarts.append(now)
+                (RUNTIME / "health.json").unlink(missing_ok=True)
+                time.sleep(1)
+                self.start_receiver()
+                print("Receiver restarted with the same display owner.", flush=True)
+            now = time.monotonic()
+            if now >= next_health:
+                atomic_json(RUNTIME / "health.json", {"installation": str(directory), "supervisor_pid": os.getpid(),
+                            "seatd_pid": self.processes[0].pid, "weston_pid": self.processes[1].pid,
+                            "receiver_pid": self.receiver.pid, "monotonic": now})
+                next_health = now + 1
+            time.sleep(0.2)
+
+
+def serve(directory):
+    metadata, plan = read_bundle(directory, installed=True)
+    require_root_tree(RUNTIME)
+    require_root_tree(WORK)
+    executable_filesystem(WORK)
+    with trial.trial_lock():
+        host = None
+        try:
+            cleanup_work()
+            host = ServiceHost(plan)
+            host.preflight()
+            begin_wifi(metadata.get("wifi_interface"))
+            host.start_seatd()
+            host.start_weston()
+            host.start_receiver()
+            host.monitor_service(directory)
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, signal.SIG_IGN)
+            (RUNTIME / "health.json").unlink(missing_ok=True)
+            if host is not None:
+                host.cleanup(keep_evidence=False)
+            # systemd ExecStopPost restores Wi-Fi, even if this process was killed.
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    p = sub.add_parser("prepare")
+    p.add_argument("--trial", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--wifi-interface")
+    for name in ("check", "install", "serve"):
+        sub.add_parser(name).add_argument("directory")
+    sub.add_parser("rollback")
+    sub.add_parser("restore-wifi")
+    args = parser.parse_args()
+    if args.action == "prepare":
+        return prepare(args)
+    if args.action == "check":
+        _, plan = read_bundle(Path(args.directory).absolute())
+        trial.preflight(plan)
+        print("Package hashes and native capabilities checked; running receiver unchanged.")
+        return
+    if os.geteuid() != 0:
+        raise Failure("This action requires Pi sudo.")
+    if args.action in ("install", "rollback"):
+        # Bounded transactions must finish, including rollback, if SSH closes.
+        for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_IGN)
+    elif args.action == "serve":
+        def interrupted(signum, frame):
+            raise KeyboardInterrupt
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, interrupted)
+    if args.action == "install":
+        install(args.directory)
+    elif args.action == "serve":
+        serve(Path(args.directory).absolute())
+    elif args.action == "rollback":
+        rollback(HERE)
+    else:
+        restore_wifi()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except (Failure, OSError, ValueError, subprocess.SubprocessError) as error:
+        print("PiPlay display service: " + str(error), file=sys.stderr)
+        raise SystemExit(1)

@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Prepare and run a bounded, reversible Pi display experiment.
+
+prepare/check run without sudo. run requires sudo and temporarily stops the
+existing uxplay.service after capability checks. Nothing is installed and no
+service configuration is changed. The explicitly supplied seatd binary runs as
+root; Weston and UxPlay run as the preparing account. seatd must be built with
+-Ddefaultpath=seatd.sock (relative), never the stock /run/seatd.sock default.
+This is an experiment, not qualification of decoding, HDMI picture or sound.
+"""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import selectors
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SERVICE = "uxplay.service"
+SCHEMA = "piplay-display-trial-v1"
+SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C.UTF-8"}
+REPLACED = {"vs", "fs", "display-owner", "screen-info", "airplay-video-backend",
+            "mpv-decode", "mpv-vo", "mpv-h264-hwdec", "mpv-render-profile",
+            "mpv-gpu-context", "mpv-gpu-api", "mpv-drm-device", "mpv-drm-connector"}
+TRIAL_OPTIONS = ('display-owner wayland\nvs waylandsink\n'
+                 'airplay-video-backend mpv\nmpv-decode pi4-wayland-experimental\n'
+                 'mpv-vo dmabuf-wayland\nmpv-h264-hwdec v4l2m2m\n'
+                 'mpv-render-profile default\nscreen-info status\n')
+WAYLAND_NULL_PROBE = '''import ctypes
+gst = ctypes.CDLL("libgstreamer-1.0.so.0")
+gobject = ctypes.CDLL("libgobject-2.0.so.0")
+gst.gst_init.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+gst.gst_init.restype = None
+gst.gst_element_factory_make.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+gst.gst_element_factory_make.restype = ctypes.c_void_p
+gst.gst_object_unref.argtypes = [ctypes.c_void_p]
+gst.gst_object_unref.restype = None
+gobject.g_object_set.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+gobject.g_object_set.restype = None
+gst.gst_init(None, None)
+sink = gst.gst_element_factory_make(b"waylandsink", None)
+if not sink:
+    raise SystemExit(1)
+gobject.g_object_set(sink, b"fullscreen", ctypes.c_int(1), ctypes.c_void_p())
+gst.gst_object_unref(sink)
+'''
+
+
+class Failure(RuntimeError):
+    pass
+
+
+class RecoveryRequired(Failure):
+    """A trial process may still own hardware; never start a competing player."""
+
+
+def digest(path):
+    with Path(path).open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def regular(path, executable=False):
+    path = Path(path).absolute()
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise Failure("A pinned path contains a symbolic link.")
+    if not path.is_file() or (executable and not os.access(path, os.X_OK)):
+        raise Failure("A required pinned file is absent or not executable.")
+    return path
+
+
+def quirks_directory(path):
+    path = Path(path)
+    if not path.is_absolute() or any(p.is_symlink() for p in (path, *path.parents)) or not path.is_dir():
+        raise Failure("The libinput quirks path must be an existing absolute directory without symbolic links.")
+    return str(path)
+
+
+def dependency_environment(plan):
+    environment = {"LD_LIBRARY_PATH": ":".join(plan["library_dirs"])} if plan["library_dirs"] else {}
+    if "libinput_quirks_dir" in plan:
+        environment["LIBINPUT_QUIRKS_DIR"] = quirks_directory(plan["libinput_quirks_dir"])
+    return environment
+
+
+def plugin_detail(text, key):
+    values = re.findall(r"^\s*" + re.escape(key) + r"\s+(.+?)\s*$", text, re.MULTILINE)
+    if len(values) != 1:
+        raise Failure("Cannot verify the selected Wayland plugin metadata.")
+    return values[0]
+
+
+def registry_environment(path):
+    return {"GST_REGISTRY": str(path), "GST_REGISTRY_1_0": str(path)}
+
+
+def stage_wayland_plugin(plan, directory):
+    """Snapshot one plugin, excluding its stock duplicate from discovery."""
+    entry = plan["files"]["wayland_plugin"]
+    plugin_bytes = regular(entry["path"]).read_bytes()
+    if hashlib.sha256(plugin_bytes).hexdigest() != entry["sha256"]:
+        raise Failure("The pinned Wayland plugin changed; prepare again.")
+    directory.mkdir(mode=0o700)
+    plugins = directory / "plugins"
+    plugins.mkdir(mode=0o700)
+    system_plugins = directory / "system-plugins"
+    system_plugins.mkdir(mode=0o700)
+    state = directory / "state"
+    state.mkdir(mode=0o700)
+    os.chown(state, plan["uid"], plan["gid"])
+    candidate = plugins / "libgstwaylandsink.so"
+    with candidate.open("xb") as target:
+        target.write(plugin_bytes)
+    candidate.chmod(0o644)
+    directory.chmod(0o711)
+    for path in (plugins, system_plugins):
+        path.chmod(0o755)  # GStreamer must enumerate plugin filenames as the user.
+    # Even discovery of the installed plugin gets a fresh registry. No cache
+    # from the user's home or invoking shell participates in this experiment.
+    code, text = capture(user_command(plan, [system_tool("gst-inspect-1.0"), "waylandsink"],
+                                     registry_environment(state / "baseline.bin")))
+    if code:
+        raise Failure("Cannot inspect the installed Wayland plugin before the trial.")
+    installed = Path(plugin_detail(text, "Filename")).resolve(strict=True)
+    if installed.name != "libgstwaylandsink.so" or not installed.is_file():
+        raise Failure("Cannot locate the installed Wayland plugin directory.")
+    for path in installed.parent.iterdir():
+        if path.name != installed.name and path.name.endswith(".so") and path.is_file():
+            (system_plugins / path.name).symlink_to(path.resolve(strict=True))
+    environment = dict(registry_environment(state / "candidate.bin"),
+                       GST_PLUGIN_PATH=str(plugins), GST_PLUGIN_PATH_1_0=str(plugins),
+                       GST_PLUGIN_SYSTEM_PATH=str(system_plugins), GST_PLUGIN_SYSTEM_PATH_1_0=str(system_plugins))
+    return {"environment": environment, "candidate": candidate, "installed": installed,
+            "version": plugin_detail(text, "Version")}
+
+
+def wayland_support_library(text):
+    matches = re.findall(r"^\s*libgstwayland-1\.0\.so\.0\s+=>\s+(\S+)\s+\(", text, re.MULTILINE)
+    if len(matches) != 1 or not Path(matches[0]).is_absolute():
+        raise Failure("Cannot verify the installed GStreamer Wayland support library.")
+    return str(Path(matches[0]).resolve())
+
+
+def config_key(line):
+    text = line.lstrip(" ")
+    if not text.strip() or text.startswith("#"):
+        return None
+    return text.split(None, 1)[0].removeprefix("-")
+
+
+def trial_config(text, mpv_executable=None):
+    if len(text.encode()) > 65536 or "\0" in text:
+        raise Failure("Receiver configuration is invalid or too large.")
+    replaced = REPLACED
+    override = ""
+    if mpv_executable is not None:
+        path = str(mpv_executable)
+        # Match UxPlay's simple quoted configuration tokens exactly; it does
+        # not implement shell escaping or shell expansion.
+        if any(ord(char) < 32 or char in '\\"' for char in path):
+            raise Failure("The pinned mpv path cannot be represented in receiver configuration.")
+        replaced = REPLACED | {"mpv-executable"}
+        override = 'mpv-executable "' + path + '"\n'
+    # Preserve the exact unrelated lines, including names, pairing and audio.
+    kept = [line for line in text.splitlines(keepends=True) if config_key(line) not in replaced]
+    result = "".join(kept)
+    if result and not result.endswith("\n"):
+        result += "\n"
+    return result + TRIAL_OPTIONS + override
+
+
+def write_private(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as target:
+        target.write(text)
+
+
+def prepare(args):
+    account = pwd.getpwuid(os.getuid())
+    if account.pw_uid == 0:
+        raise Failure("Run prepare as the existing receiver account without sudo.")
+    release = Path(args.release).absolute()
+    binary = regular(release / "uxplay", True)
+    build = json.loads(regular(release / "build.json").read_text())
+    if build.get("binary_sha256") != digest(binary) or build.get("mpv_backend") is not True:
+        raise Failure("The immutable release hash or mpv build metadata does not match.")
+    original = regular(args.config)
+    files = {"receiver": binary, "weston": regular(args.weston, True),
+             "seatd": regular(args.seatd, True), "backend": regular(args.weston_backend),
+             "shell": regular(args.weston_shell)}
+    mpv_executable = getattr(args, "mpv_executable", None)
+    if mpv_executable is not None:
+        files["mpv"] = regular(mpv_executable, True)
+    wayland_plugin = getattr(args, "wayland_plugin", None)
+    if wayland_plugin is not None:
+        files["wayland_plugin"] = regular(wayland_plugin)
+    libraries = [str(Path(p).resolve(strict=True)) for p in args.library_dir]
+    if any(not Path(p).is_dir() or ":" in p for p in libraries):
+        raise Failure("Each library directory must exist and contain no colon.")
+    quirks = getattr(args, "libinput_quirks_dir", None)
+    if quirks is not None:
+        quirks = quirks_directory(Path(quirks).absolute())
+    output = Path(args.output).absolute()
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    try:
+        write_private(output / "receiver.conf", trial_config(original.read_text(), files.get("mpv")))
+        manifest = {"schema": SCHEMA, "user": account.pw_name, "uid": account.pw_uid,
+                    "gid": account.pw_gid, "home": account.pw_dir,
+                    "source_config_sha256": digest(original), "library_dirs": libraries,
+                    "output": args.output_name, "seatd_socket": "seatd.sock",
+                    "files": {key: {"path": str(path), "sha256": digest(path)}
+                              for key, path in files.items()},
+                    "config_sha256": digest(output / "receiver.conf")}
+        if quirks is not None:
+            manifest["libinput_quirks_dir"] = quirks
+        write_private(output / "trial.json", json.dumps(manifest, indent=2) + "\n")
+    except BaseException:
+        shutil.rmtree(output)
+        raise
+    print("Prepared private trial files: " + str(output))
+
+
+def load_plan(directory, installed=False):
+    directory = Path(directory).absolute()
+    manifest_path = regular(directory / "trial.json")
+    plan = json.loads(manifest_path.read_text())
+    if plan.get("schema") != SCHEMA:
+        raise Failure("Unknown trial manifest format.")
+    account = pwd.getpwnam(plan["user"])
+    if account.pw_uid == 0 or (account.pw_uid, account.pw_gid, account.pw_dir) != (
+            plan["uid"], plan["gid"], plan["home"]):
+        raise Failure("The preparing account has changed or is root.")
+    if os.getuid() not in (0, account.pw_uid):
+        raise Failure("Use the preparing account to check or run this trial.")
+    for path in (directory, manifest_path, regular(directory / "receiver.conf")):
+        info = path.stat()
+        if installed:
+            if info.st_uid != 0 or info.st_gid != account.pw_gid or info.st_mode & 0o027:
+                raise Failure("Installed plans must be root-owned and only readable by the receiver group.")
+        elif info.st_uid != account.pw_uid or info.st_mode & 0o077:
+            raise Failure("Trial files must be private and owned by the preparing account.")
+    pinned_keys = ("receiver", "weston", "seatd", "backend", "shell") + tuple(
+        key for key in ("mpv", "wayland_plugin") if key in plan["files"])
+    for key in pinned_keys:
+        entry = plan["files"][key]
+        path = regular(entry["path"], key in ("receiver", "weston", "seatd", "mpv"))
+        if digest(path) != entry["sha256"]:
+            raise Failure("A pinned executable or module has changed; prepare again.")
+    config = directory / "receiver.conf"
+    pinned_mpv = plan["files"].get("mpv", {}).get("path")
+    if digest(config) != plan["config_sha256"] or trial_config(config.read_text(), pinned_mpv) != config.read_text():
+        raise Failure("Prepared configuration has changed or contains conflicting display options.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", plan["output"]):
+        raise Failure("Invalid HDMI output name.")
+    if plan.get("seatd_socket") != "seatd.sock":
+        raise Failure("Only the private relative seatd socket build is supported.")
+    for directory_name in plan["library_dirs"]:
+        if not Path(directory_name).is_absolute() or not Path(directory_name).is_dir() or ":" in directory_name:
+            raise Failure("Invalid library directory.")
+    if "libinput_quirks_dir" in plan:
+        quirks_directory(plan["libinput_quirks_dir"])
+    plan["config_path"] = str(config)
+    return plan
+
+
+def terminate_group(process):
+    # The argv form of runuser -u (without -c/--pty) retains our process group.
+    # Kill the owned group even when its leader has exited with children alive.
+    for sig, timeout in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            process.wait(timeout=1)
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            process.poll()  # Reap the leader while waiting for descendants.
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                process.wait(timeout=1)
+                return
+            time.sleep(0.05)
+    raise RecoveryRequired("A trial process group did not exit after its kill deadline.")
+
+
+def capture(argv, env=None, timeout=10):
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True, env=env or SAFE_ENV)
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                if time.monotonic() >= deadline:
+                    raise Failure("A capability check timed out.")
+                if not selector.select(0.1):
+                    continue
+                block = os.read(process.stdout.fileno(), 8192)
+                if not block:
+                    break
+                output.extend(block)
+                if len(output) > 262144:
+                    raise Failure("A capability check exceeded its output limit.")
+        status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return status, output.decode("utf-8", "replace")
+    finally:
+        try:
+            terminate_group(process)
+        finally:
+            process.stdout.close()
+
+
+def system_tool(name):
+    path = shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
+    if not path:
+        raise Failure("A required system tool is unavailable: " + name)
+    return path
+
+
+def user_command(plan, arguments, environment=None):
+    env = dict(SAFE_ENV, HOME=plan["home"], USER=plan["user"], LOGNAME=plan["user"])
+    env.update(environment or {})
+    command = [system_tool("env"), "-i"] + [key + "=" + value for key, value in env.items()] + list(arguments)
+    if os.geteuid() == 0:
+        return [system_tool("runuser"), "-u", plan["user"], "--"] + command
+    return command
+
+
+def preflight(plan, plugin_selection=None):
+    if "wayland_plugin" not in plan["files"]:
+        return check_capabilities(plan)
+    if plugin_selection is not None:
+        return check_capabilities(plan, plugin_selection)
+    with tempfile.TemporaryDirectory(prefix="piplay-plugin-check-") as temporary:
+        directory = Path(temporary).resolve()
+        directory.chmod(0o711)
+        return check_capabilities(plan, stage_wayland_plugin(plan, directory / "gstreamer"))
+
+
+def check_capabilities(plan, plugin_selection=None):
+    files = {key: value["path"] for key, value in plan["files"].items()}
+    environment = dependency_environment(plan)
+    if plugin_selection is not None:
+        environment.update(plugin_selection["environment"])
+        if digest(regular(plugin_selection["candidate"])) != plan["files"]["wayland_plugin"]["sha256"]:
+            raise Failure("The trial Wayland plugin snapshot changed.")
+        registry = Path(environment["GST_REGISTRY"])
+        if registry.exists() or registry.is_symlink():
+            raise Failure("The trial plugin registry must be fresh before preflight.")
+    checks = [("receiver", [files["receiver"], "-rc", plan["config_path"], "-h"],
+               ("-display-owner", "pi4-wayland-experimental", "-check-startup")),
+              ("receiver startup", [files["receiver"], "-rc", plan["config_path"], "-check-startup"], ()),
+              ("Weston", [files["weston"], "--version"], ("weston",)),
+              ("seatd", [files["seatd"], "-h"], ("-u", "-n")),
+              ("Wayland sink", [system_tool("gst-inspect-1.0"), "waylandsink"], ("fullscreen",))]
+    config = Path(plan["config_path"]).read_text()
+    mpv = shutil.which("mpv", path=SAFE_ENV["PATH"])
+    for line in config.splitlines():
+        if config_key(line) == "mpv-executable":
+            values = shlex.split(line)
+            if len(values) != 2:
+                raise Failure("Cannot interpret the configured mpv executable.")
+            mpv = values[1]
+    if "mpv" in plan["files"]:
+        pinned_mpv = plan["files"]["mpv"]
+        if mpv != pinned_mpv["path"] or digest(regular(mpv, True)) != pinned_mpv["sha256"]:
+            raise Failure("The pinned mpv executable or configuration changed; prepare again.")
+    if not mpv:
+        raise Failure("mpv is unavailable.")
+    checks.append(("mpv Wayland output", [mpv, "--no-config", "--vo=help"], ("dmabuf-wayland",)))
+    for label, argv, required in checks:
+        code, text = capture(user_command(plan, argv, environment))
+        if code or any(marker not in text for marker in required):
+            raise Failure(label + " capability check failed; the service was not stopped.")
+        if label == "Wayland sink" and plugin_selection is not None:
+            if (plugin_detail(text, "Filename") != str(plugin_selection["candidate"]) or
+                    plugin_detail(text, "Version") != plugin_selection["version"]):
+                raise Failure("GStreamer did not select the pinned matching Wayland plugin.")
+    pinned_keys = ("receiver", "weston", "seatd", "backend", "shell") + (("mpv",) if "mpv" in files else ())
+    for key in pinned_keys:
+        code, text = capture(user_command(plan, [system_tool("ldd"), files[key]], environment))
+        if "not found" in text or (code and "statically linked" not in text):
+            raise Failure("A pinned executable/module has unresolved libraries.")
+    if plugin_selection is not None:
+        support = []
+        for path, selected_environment in ((plugin_selection["installed"], {}),
+                                           (plugin_selection["candidate"], environment)):
+            code, text = capture(user_command(plan, [system_tool("ldd"), str(path)], selected_environment))
+            if code or "not found" in text:
+                raise Failure("The Wayland plugin has unresolved runtime libraries.")
+            support.append(wayland_support_library(text))
+        if support[0] != support[1]:
+            raise Failure("The trial plugin must use the installed GStreamer Wayland support library.")
+        # Construct and set the property only in NULL state: this catches the
+        # upstream fullscreen setter crash without opening display hardware.
+        code, _ = capture(user_command(plan, [system_tool("python3"), "-c", WAYLAND_NULL_PROBE],
+                                       dict(environment, G_DEBUG="fatal-criticals")))
+        if code:
+            raise Failure("The selected Wayland plugin failed the fullscreen property check.")
+    # seatd0.9 does not accept a socket argument/environment override. The
+    # supplied build must embed the relative default selected during its build.
+    seatd = Path(files["seatd"]).read_bytes()
+    if b"seatd.sock\0" not in seatd or b"/run/seatd.sock" in seatd or b"/var/run/seatd.sock" in seatd:
+        raise Failure("seatd must be rebuilt with -Ddefaultpath=seatd.sock for the private trial.")
+
+
+def trial_lifecycle(host, seconds):
+    if not 1 <= seconds <= 600:
+        raise Failure("The trial duration must be between 1 and 600 seconds.")
+    restore = False
+    try:
+        host.preflight()
+        was_active = host.service_active()
+        host.start_seatd()
+        if was_active:
+            restore = True  # A stop may succeed even when its response fails.
+            host.stop_service()
+        host.start_weston()
+        host.start_receiver()
+        host.monitor(seconds)
+    finally:
+        # A first interrupt arriving during cleanup must not skip child reaping
+        # and then start the baseline while a trial still owns DRM/audio.
+        saved_signals = {sig: signal.signal(sig, signal.SIG_IGN)
+                         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            try:
+                host.cleanup()
+            except RecoveryRequired:
+                restore = False
+                raise
+            finally:
+                if restore:
+                    host.restore_service()
+        finally:
+            for sig, handler in saved_signals.items():
+                signal.signal(sig, handler)
+
+
+class Host:
+    def __init__(self, plan, root_parent="/var/tmp"):
+        self.plan = plan
+        self.processes = []
+        self.logs = []
+        self.root = Path(tempfile.mkdtemp(prefix="piplay-trial-", dir=root_parent))
+        self.runtime = self.root / "runtime"
+        self.runtime.mkdir(mode=0o700)
+        os.chown(self.runtime, plan["uid"], plan["gid"])
+        self.root.chmod(0o711)  # User can traverse to their private runtime.
+        self.seat = self.root / "seat"
+        self.seat.mkdir(mode=0o711)
+        self.evidence = self.root / "logs"
+        self.evidence.mkdir(mode=0o700)
+        # The receiver can read known log names during the trial, but cannot
+        # replace directory entries while root may still need to clean up.
+        self.evidence.chmod(0o711)
+        self.files = {key: value["path"] for key, value in plan["files"].items()}
+        # Only the seat broker runs as root. Freeze its verified bytes in this
+        # root-owned directory before executing a user-local supplied build.
+        seatd_bytes = regular(self.files["seatd"]).read_bytes()
+        if hashlib.sha256(seatd_bytes).hexdigest() != plan["files"]["seatd"]["sha256"]:
+            shutil.rmtree(self.root)
+            raise Failure("The pinned seatd binary changed; prepare again.")
+        self.seatd_snapshot = self.root / "seatd-pinned"
+        with self.seatd_snapshot.open("xb") as target:
+            target.write(seatd_bytes)
+        self.seatd_snapshot.chmod(0o700)
+        self.environment = {"XDG_RUNTIME_DIR": str(self.runtime), "WAYLAND_DISPLAY": "piplay-0",
+                            "LIBSEAT_BACKEND": "seatd", "SEATD_SOCK": str(self.seat / "seatd.sock")}
+        self.environment.update(dependency_environment(plan))
+        self.plugin_selection = None
+        if "wayland_plugin" in plan["files"]:
+            self.plugin_selection = stage_wayland_plugin(plan, self.root / "gstreamer")
+            self.environment.update(self.plugin_selection["environment"])
+        print("Private trial evidence: " + str(self.evidence), flush=True)
+
+    def preflight(self):
+        preflight(self.plan, self.plugin_selection)
+
+    def service_active(self):
+        code, text = capture([system_tool("systemctl"), "show", SERVICE,
+                              "--property=LoadState,User,ActiveState"])
+        values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        if code or values.get("LoadState") != "loaded" or values.get("User") != self.plan["user"]:
+            raise Failure("The existing receiver service is absent or uses a different account.")
+        if values.get("ActiveState") not in ("active", "inactive", "failed"):
+            raise Failure("The receiver service is changing state; retry when stable.")
+        return values["ActiveState"] == "active"
+
+    def service_command(self, action):
+        code, _ = capture([system_tool("systemctl"), action, SERVICE], timeout=20)
+        if code:
+            raise Failure("Receiver service " + action + " failed.")
+
+    def stop_service(self):
+        self.service_command("stop")
+        if self.service_active():
+            raise Failure("The existing service did not stop.")
+
+    def restore_service(self):
+        self.service_command("start")
+        if not self.service_active():
+            raise Failure("The original receiver service did not return to active state.")
+        print("Original receiver service restored.", flush=True)
+
+    def launch(self, label, arguments, environment=None, cwd=None):
+        descriptor = os.open(self.evidence / (label + ".log"),
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, self.plan["uid"], self.plan["gid"])
+            stream = os.fdopen(descriptor, "wb", buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self.logs.append(stream)
+        process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=stream,
+                                   stderr=subprocess.STDOUT, env=environment or SAFE_ENV,
+                                   cwd=cwd, start_new_session=True)
+        self.processes.append(process)
+        return process
+
+    def wait_socket(self, process, path):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise Failure("A trial display process exited during startup; inspect private logs.")
+            if path.exists() and stat.S_ISSOCK(path.stat().st_mode):
+                return
+            time.sleep(0.05)
+        raise Failure("A trial display socket did not become ready before its deadline.")
+
+    def start_seatd(self):
+        # Relative compiled socket path and root-owned cwd isolate this broker
+        # from any existing system seatd. Never set LD_LIBRARY_PATH for root.
+        process = self.launch("seatd", [str(self.seatd_snapshot), "-u", self.plan["user"], "-l", "info"],
+                              cwd=self.seat)
+        self.wait_socket(process, self.seat / "seatd.sock")
+
+    def start_weston(self):
+        config = self.runtime / "weston.ini"
+        write_private(config, "[core]\nidle-time=0\nrequire-input=false\nxwayland=false\n"
+                      "[output]\nname=" + self.plan["output"] + "\nmode=current\n")
+        os.chown(config, self.plan["uid"], self.plan["gid"])
+        # Weston14 accepts a backend name, not an absolute module path. This
+        # pinned Weston build locates drm-backend.so inside its install prefix.
+        command = [self.files["weston"], "--backend=drm",
+                   "--shell=" + self.files["shell"], "--config=" + str(config),
+                   "--socket=piplay-0", "--idle-time=0"]
+        process = self.launch("weston", user_command(self.plan, command, self.environment))
+        self.wait_socket(process, self.runtime / "piplay-0")
+
+    def start_receiver(self):
+        self.launch("receiver", user_command(self.plan, [self.files["receiver"], "-rc", self.plan["config_path"]],
+                                              self.environment), cwd=self.plan["home"])
+
+    def monitor(self, seconds):
+        print("Display trial running for at most " + str(seconds) + " seconds; Ctrl-C restores the receiver.", flush=True)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if any(process.poll() is not None for process in self.processes):
+                raise Failure("A trial process exited; restoring the original receiver.")
+            if any(os.fstat(stream.fileno()).st_size > 32 * 1024 * 1024 for stream in self.logs):
+                raise Failure("Private trial logs reached their size limit; ending the trial.")
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+    def cleanup(self, keep_evidence=True):
+        failed = False
+        for process in reversed(self.processes):
+            try:
+                terminate_group(process)
+            except (Failure, OSError, subprocess.SubprocessError):
+                failed = True
+        for stream in self.logs:
+            stream.close()
+        if failed:
+            raise RecoveryRequired("Trial child exit could not be confirmed. The original receiver remains stopped. "
+                                   "Reboot the Pi before starting uxplay.service; private trial evidence was retained.")
+        # Only directories created by this invocation, never a shared runtime.
+        shutil.rmtree(self.runtime)
+        shutil.rmtree(self.seat)
+        if self.plugin_selection is not None:
+            shutil.rmtree(self.root / "gstreamer")
+        self.seatd_snapshot.unlink()
+        if not keep_evidence:
+            shutil.rmtree(self.root)
+            return
+        # Tighten modes before handing over ownership. No root path operation
+        # follows ownership transfer of the parent directory.
+        self.evidence.chmod(0o700)
+        os.chown(self.evidence, self.plan["uid"], self.plan["gid"])
+        self.root.chmod(0o700)
+        os.chown(self.root, self.plan["uid"], self.plan["gid"])
+
+
+@contextmanager
+def trial_lock(path="/run/piplay-display-trial.lock"):
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode):
+            raise Failure("Trial lock ownership is invalid.")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Failure("Another display trial is already running.") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("prepare", help="create private trial files without changing the running receiver")
+    for name in ("release", "config", "output", "weston", "seatd", "weston-backend", "weston-shell"):
+        create.add_argument("--" + name, required=True)
+    create.add_argument("--library-dir", action="append", default=[])
+    create.add_argument("--output-name", default="HDMI-A-1")
+    create.add_argument("--mpv-executable", help="pin a private mpv binary and override only the trial configuration")
+    create.add_argument("--libinput-quirks-dir", help="use private libinput quirks data in the trial user environment")
+    create.add_argument("--wayland-plugin", help="pin a private libgstwaylandsink.so with an isolated plugin registry")
+    for name in ("check", "run"):
+        command = commands.add_parser(name, help="check capabilities" if name == "check" else "run a temporary hardware trial with sudo")
+        command.add_argument("directory")
+        if name == "run":
+            command.add_argument("--seconds", type=int, default=600)
+    args = parser.parse_args(argv)
+    if args.command == "prepare":
+        prepare(args)
+        return
+    plan = load_plan(args.directory)
+    if args.command == "check":
+        preflight(plan)
+        print("Pinned files and startup capabilities checked. Hardware playback has not been tested.")
+        return
+    if os.geteuid() != 0:
+        raise Failure("Run the prepared trial with sudo; prepare and check need no sudo.")
+    if not 1 <= args.seconds <= 600:
+        raise Failure("The trial duration must be between 1 and 600 seconds.")
+    def interrupted(signum, frame):
+        # A second SSH hangup/Ctrl-C must not interrupt service restoration.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)
+        raise KeyboardInterrupt
+    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        with trial_lock():
+            trial_lifecycle(Host(plan), args.seconds)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Trial interrupted; cleanup completed.", file=sys.stderr)
+        raise SystemExit(130)
+    except (Failure, OSError, ValueError, KeyError, subprocess.SubprocessError):
+        # Raw command output and configurations may contain media/pairing data.
+        # Detailed logs remain private; fixed Failure text is safe to display.
+        error = sys.exc_info()[1]
+        print(str(error) if isinstance(error, Failure) else "Trial failed; inspect the private files and logs.", file=sys.stderr)
+        raise SystemExit(1)

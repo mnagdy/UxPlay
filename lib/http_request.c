@@ -30,7 +30,8 @@ struct http_request_s {
     bool is_reverse;  // if true, this is a reverse-response from client
     const char *method;
     char *url;
-    char protocol[9];
+    char protocol[16];
+    size_t protocol_name_len;
 
     char **headers;
     int headers_size;
@@ -54,8 +55,35 @@ on_url(llhttp_t *parser, const char *at, size_t length)
     request->url[urllen] = '\0';
     strncat(request->url, at, length);
 
-    strncpy(request->protocol, at + length + 1, 8);
+    return 0;
+}
 
+static int
+on_protocol(llhttp_t *parser, const char *at, size_t length)
+{
+    http_request_t *request = parser->data;
+    /* llhttp recognizes HTTP, RTSP and ICE. Its protocol span may arrive in
+     * several input chunks and excludes the slash and version. */
+    if (length > 4 - request->protocol_name_len) {
+        llhttp_set_error_reason(parser, "Protocol name too long");
+        return HPE_USER;
+    }
+    memcpy(request->protocol + request->protocol_name_len, at, length);
+    request->protocol_name_len += length;
+    request->protocol[request->protocol_name_len] = '\0';
+    return 0;
+}
+
+static int
+on_version_complete(llhttp_t *parser)
+{
+    http_request_t *request = parser->data;
+    /* Derive the version from parsed state, never from bytes beyond a span.
+     * The buffer also accommodates the full range of llhttp's uint8 getters. */
+    snprintf(request->protocol + request->protocol_name_len,
+             sizeof(request->protocol) - request->protocol_name_len, "/%u.%u",
+             (unsigned int) llhttp_get_http_major(parser),
+             (unsigned int) llhttp_get_http_minor(parser));
     return 0;
 }
 
@@ -152,6 +180,8 @@ http_request_init(void)
 
     llhttp_settings_init(&request->parser_settings);
     request->parser_settings.on_url = &on_url;
+    request->parser_settings.on_protocol = &on_protocol;
+    request->parser_settings.on_version_complete = &on_version_complete;
     request->parser_settings.on_header_field = &on_header_field;
     request->parser_settings.on_header_value = &on_header_value;
     request->parser_settings.on_body = &on_body;
@@ -257,6 +287,21 @@ http_request_get_protocol(http_request_t *request)
     return request->protocol;
 }
 
+/* HTTP and RTSP field names use ASCII case-insensitive matching. Keep the
+ * stored spelling and field values unchanged, independent of the locale. */
+static int
+header_name_equals(const char *left, const char *right)
+{
+    while (*left && *right) {
+        unsigned char a = (unsigned char) *left++;
+        unsigned char b = (unsigned char) *right++;
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return 0;
+    }
+    return *left == *right;
+}
+
 const char *
 http_request_get_header(http_request_t *request, const char *name)
 {
@@ -266,7 +311,7 @@ http_request_get_header(http_request_t *request, const char *name)
     }
 
     for (int i = 0; i < request->headers_size; i += 2) {
-        if (!strcmp(request->headers[i], name)) {
+        if (header_name_equals(request->headers[i], name)) {
             return request->headers[i+1];
         }
     }

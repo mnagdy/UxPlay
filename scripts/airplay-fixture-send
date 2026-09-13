@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Send a local, trusted test fixture through UxPlay's direct AirPlay endpoint.
+
+Uses the existing receiver and its HDMI/audio settings. Replaces current video.
+Serves only the supplied file; TS mode paces a known-duration MPEG-TS fixture.
+No player IPC, service changes, credentials, or third-party media are involved.
+"""
+import argparse
+import http.client
+import http.server
+import json
+import pathlib
+import plistlib
+import re
+import socket
+import threading
+import time
+import uuid
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--host', required=True)
+    p.add_argument('--port', type=int, required=True, help='Current advertised AirPlay port')
+    p.add_argument('--file', type=pathlib.Path, required=True)
+    p.add_argument('--kind', choices=['mp4', 'ts'], default='mp4')
+    p.add_argument('--duration', type=float, default=45, help='Actual TS fixture duration')
+    p.add_argument('--seconds', type=float, default=40, help='Trial duration before session stop')
+    p.add_argument('--output', type=pathlib.Path, required=True)
+    args = p.parse_args()
+    if not 1 <= args.seconds <= 300 or not 1 <= args.duration <= 300:
+        p.error('Durations must be between 1 and 300 seconds')
+    fixture = args.file.resolve(strict=True)
+    if not fixture.is_file():
+        p.error('Fixture must be a file')
+    size = fixture.stat().st_size
+    if args.kind == 'ts' and size % 188:
+        p.error('TS fixture must contain whole 188-byte packets')
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+        route.connect((args.host, args.port))
+        local_ip = route.getsockname()[0]
+    token = uuid.uuid4().hex
+    media_path = '/' + token + ('.mp4' if args.kind == 'mp4' else '.ts')
+    stopped = threading.Event()
+    result = {'kind': args.kind, 'fixture': fixture.name, 'file_bytes': size,
+              'http_requests': 0, 'served_bytes': 0, 'samples': []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *_):
+            pass
+
+        def do_HEAD(self):
+            self.serve(False)
+
+        def do_GET(self):
+            self.serve(True)
+
+        def serve(self, body):
+            if self.path != media_path:
+                self.send_error(404)
+                return
+            result['http_requests'] += 1
+            start, end = 0, size - 1
+            partial = False
+            if args.kind == 'mp4' and self.headers.get('Range'):
+                match = re.fullmatch(r'bytes=(\d+)-(\d*)', self.headers['Range'])
+                if not match or int(match[1]) >= size:
+                    self.send_error(416)
+                    return
+                start = int(match[1])
+                end = min(int(match[2]), end) if match[2] else end
+                if end < start:
+                    self.send_error(416)
+                    return
+                partial = True
+            self.send_response(206 if partial else 200)
+            self.send_header('Content-Type', 'video/mp4' if args.kind == 'mp4' else 'video/mp2t')
+            self.send_header('Connection', 'close')
+            if args.kind == 'mp4':
+                self.send_header('Content-Length', str(end - start + 1))
+                self.send_header('Accept-Ranges', 'bytes')
+                if partial:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self.end_headers()
+            self.close_connection = True
+            if not body:
+                return
+            try:
+                with fixture.open('rb') as source:
+                    source.seek(start)
+                    remaining, sent, began = end - start + 1, 0, time.monotonic()
+                    while remaining and not stopped.is_set():
+                        chunk = source.read(min(188 * 70, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        result['served_bytes'] += len(chunk)
+                        remaining -= len(chunk)
+                        sent += len(chunk)
+                        if args.kind == 'ts':
+                            # Two-second initial probe allowance, then average-bitrate pacing.
+                            delay = sent / size * args.duration - 2 - (time.monotonic() - began)
+                            if delay > 0 and stopped.wait(delay):
+                                break
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = http.server.ThreadingHTTPServer((local_ip, 0), Handler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    session = str(uuid.uuid4())
+    headers = {'X-Apple-Session-ID': session, 'Content-Type': 'application/x-apple-binary-plist'}
+
+    def request(method, path, body=None):
+        conn = http.client.HTTPConnection(args.host, args.port, timeout=6)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            data = response.read(262145)
+            if len(data) > 262144:
+                raise RuntimeError('Oversized receiver response')
+            return response.status, data
+        finally:
+            conn.close()
+
+    accepted = False
+    try:
+        body = plistlib.dumps({'Content-Location': f'http://{local_ip}:{server.server_port}{media_path}',
+                              'Start-Position-Seconds': 0.0, 'uuid': str(uuid.uuid4()),
+                              'clientProcName': 'Independent HEVC test'}, fmt=plistlib.FMT_BINARY)
+        status, _ = request('POST', '/play', body)
+        result['play_status'] = status
+        if status != 200:
+            raise RuntimeError(f'Play rejected: HTTP {status}')
+        accepted = True
+        print(f'{args.kind.upper()} fixture accepted; watch for moving pattern and quiet tone.', flush=True)
+        began = time.monotonic()
+        while time.monotonic() - began < args.seconds:
+            stopped.wait(min(5, max(0, args.seconds - (time.monotonic() - began))))
+            status, data = request('GET', '/playback-info')
+            sample = {'elapsed': round(time.monotonic() - began, 2), 'status': status}
+            if data and status == 200:
+                info = plistlib.loads(data)
+                for key in ('position', 'duration', 'rate', 'readyToPlay', 'playbackBufferEmpty'):
+                    value = info.get(key)
+                    if isinstance(value, (bool, int, float)):
+                        sample[key] = value
+            result['samples'].append(sample)
+            print(json.dumps(sample), flush=True)
+            if status != 200:
+                break
+    finally:
+        if accepted:
+            try:
+                result['stop_status'], _ = request('POST', '/stop', b'')
+            except (OSError, http.client.HTTPException):
+                result['stop_status'] = 'unavailable'
+        stopped.set()
+        server.shutdown()
+        server.server_close()
+        args.output.write_text(json.dumps(result, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()

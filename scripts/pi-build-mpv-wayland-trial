@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Build a pinned mpv0.40 Wayland repair without changing installed software.
+
+Uses the installed Debian package's original source and Debian patch set, then
+backports upstream fixes for initial fullscreen resize and hardware-driver
+selection. The FFmpeg image-format test reference includes only the five extra
+formats declared by this Pi's pinned downstream FFmpeg headers; tests run normally.
+Dependencies are downloaded from authenticated APT metadata and extracted only
+inside the dedicated user directory. No media, receiver, compositor, seat broker
+or system service is started. Requires the companion pi-build-weston-trial.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import subprocess
+import tarfile
+
+
+DEBIAN_VERSION = "0.40.0-3+deb13u1"
+SOURCES = {
+    "mpv_0.40.0.orig.tar.gz": "10a0f4654f62140a6dd4d380dcf0bbdbdcf6e697556863dc499c296182f081a3",
+    "mpv_0.40.0-3+deb13u1.debian.tar.xz": "0ff48f510c1db2a51f7a5d2894bef0984aabb81a95c6f84efc92ed206822a284",
+}
+SOURCE_BASE = "https://deb.debian.org/debian/pool/main/m/mpv/"
+UPSTREAM_COMMIT = "2bc3bddfb990065b9d7e6270ee07b3063549f8c2"
+UPSTREAM_PATCH_SHA256 = "ea42e92d5e0c7b45a1ff22509b5e72da8a81f630c53356fb4b925e96135a24c5"
+PATCHES = {
+    "mpv-dmabuf-drivers.patch": {
+        "sha256": "56ae2c0a1d2258c5c8af1f0d7701265ad8d4cfc29d4bc93083cf50c0b04fcf79",
+        "upstream_commit": UPSTREAM_COMMIT,
+        "upstream_patch_sha256": UPSTREAM_PATCH_SHA256,
+        "adaptation": "Context-only backport to 0.40.0; upstream semantic changes unchanged.",
+    },
+    "mpv-dmabuf-initial-resize.patch": {
+        "sha256": "c9d63635be45b8428d2aba8ce61282aa3e400f16415ba35e878e0f76a81ea84b",
+        "upstream_commit": "43ce03c519f6ca7e61c73616d4aa10ecb4a380d2",
+        "adaptation": "Unmodified upstream patch; prevents resize before image geometry exists.",
+    },
+    "mpv-ffmpeg7-rpi-formats.patch": {
+        "sha256": "e4fb737ffde3429f8ccab31fe08f8089b7b41df23250ee51395786189fa7862e",
+        "adaptation": "Local test reference: only the five pinned downstream Pi FFmpeg formats.",
+        "libavutil_dev_sha256": "76f0554065a40cb80929184b5c46a6a34bba106ad21480220a10dd9f1373de66",
+        "reference_before_sha256": "6792534b28449a0e8dfd4cf4d19fd30b1c420d8d8490181108018e4e95bdb878",
+        "reference_after_sha256": "7d8fa93416ee8d1ed6124e6b9c9a1701e50e7dc0b08fedbdb3230c966426127b",
+    },
+}
+PACKAGES = ["meson", "ninja-build", "libass-dev", "libavcodec-dev", "libavdevice-dev",
+            "libavfilter-dev", "libavformat-dev", "libavutil-dev", "libswresample-dev",
+            "libswscale-dev", "libplacebo-dev", "libasound2-dev", "libdrm-dev",
+            "libegl-dev", "libgbm-dev", "libgl-dev", "libva-dev", "libvulkan-dev",
+            "libwayland-dev", "libxkbcommon-dev", "wayland-protocols",
+            "libdisplay-info-dev", "liblua5.2-dev", "zlib1g-dev"]
+OPTIONS = ["--buildtype=debugoptimized", "--libdir=lib", "--wrap-mode=nodownload",
+           "--auto-features=disabled", "-Dlibmpv=false", "-Dcplayer=true", "-Dbuild-date=false",
+           "-Dtests=true", "-Dlua=lua5.2", "-Dalsa=enabled", "-Ddrm=enabled",
+           "-Dgl=enabled", "-Degl=enabled", "-Degl-drm=enabled", "-Degl-wayland=enabled",
+           "-Dgbm=enabled", "-Ddmabuf-wayland=enabled", "-Dwayland=enabled",
+           "-Dvulkan=enabled", "-Dvaapi=enabled", "-Dvaapi-wayland=enabled",
+           "-Dvaapi-drm=enabled", "-Dlibavdevice=enabled", "-Diconv=enabled",
+           "-Dzlib=enabled", "-Dvector=enabled", "-Dmanpage-build=disabled"]
+
+
+def helpers():
+    path = Path(__file__).resolve().with_name("pi-build-weston-trial")
+    loader = importlib.machinery.SourceFileLoader("piplay_build_dependencies", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    module.PACKAGES = PACKAGES
+    return module
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.home() / "uxplay-dev/mpv-wayland-trial-r2")
+    parser.add_argument("--jobs", type=int, default=2)
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        parser.error("Run as the receiver user; this build must never run as root.")
+    if platform.system() != "Linux" or platform.machine() != "aarch64":
+        parser.error("This recipe targets the aarch64 Raspberry Pi environment.")
+    if not 1 <= args.jobs <= 4:
+        parser.error("Use 1 to 4 build jobs.")
+    h = helpers()
+    installed = h.output(["dpkg-query", "-W", "-f=${Version}", "mpv"]).strip()
+    if installed != DEBIAN_VERSION:
+        raise RuntimeError("Installed mpv differs from the source pinned by this recipe; review the new source first.")
+    root = args.root.expanduser().resolve()
+    if not root.is_relative_to(Path.home().resolve()) or root == Path.home().resolve():
+        parser.error("The dedicated build root must be inside your home directory.")
+    root.mkdir(parents=True, exist_ok=True)
+    patch_dir = Path(__file__).resolve().parent.parent / "patches"
+    for filename, metadata in PATCHES.items():
+        if h.sha256(patch_dir / filename) != metadata["sha256"]:
+            raise RuntimeError("A backport or platform reference patch does not match its pinned digest.")
+    lock = h.dependency_lock(root)
+    platform_reference = PATCHES["mpv-ffmpeg7-rpi-formats.patch"]
+    if not any(p["package"] == "libavutil-dev" and p["sha256"] == platform_reference["libavutil_dev_sha256"]
+               for p in lock["packages"]):
+        raise RuntimeError("The platform test reference requires the pinned Pi libavutil development package.")
+    deps = h.extract_dependencies(root, lock)
+    archives = root / "archives"
+    for filename, digest in SOURCES.items():
+        h.download(SOURCE_BASE + filename, archives / filename, digest)
+    source = root / "source/mpv-0.40.0"
+    stamp = root / "source-patch.sha256"
+    source_digest = hashlib.sha256(json.dumps({"sources": SOURCES, "patches": PATCHES}, sort_keys=True).encode()).hexdigest()
+    if source.exists() and (not stamp.exists() or stamp.read_text().strip() != source_digest):
+        raise RuntimeError("Existing source uses another patch set. Choose a new dedicated --root.")
+    if not source.exists():
+        source.parent.mkdir(exist_ok=True)
+        with tarfile.open(archives / "mpv_0.40.0.orig.tar.gz") as archive:
+            archive.extractall(source.parent, filter="data")
+        with tarfile.open(archives / "mpv_0.40.0-3+deb13u1.debian.tar.xz") as archive:
+            archive.extractall(source, filter="data")
+        for line in (source / "debian/patches/series").read_text().splitlines():
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if "/" in entry or " " in entry or entry.startswith("-"):
+                raise RuntimeError("Unexpected Debian patch-series format.")
+            h.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", source / "debian/patches" / entry], cwd=source)
+        reference = source / "test/ref/ffmpeg7/img_formats.txt"
+        if h.sha256(reference) != platform_reference["reference_before_sha256"]:
+            raise RuntimeError("Unexpected upstream FFmpeg image-format test reference.")
+        for filename in PATCHES:
+            h.run(["patch", "--batch", "--fuzz=0", "-p1", "-i", patch_dir / filename], cwd=source)
+        stamp.write_text(source_digest + "\n")
+    if h.sha256(source / "test/ref/ffmpeg7/img_formats.txt") != platform_reference["reference_after_sha256"]:
+        raise RuntimeError("The Pi FFmpeg image-format test reference was changed unexpectedly.")
+    prefix = root / "mpv-0.40.0-piplay-r2"
+    env = os.environ.copy()
+    env["PATH"] = str(deps / "usr/bin") + ":" + env.get("PATH", "")
+    env["PYTHONPATH"] = str(deps / "usr/lib/python3/dist-packages")
+    env["PKG_CONFIG_PATH"] = ":".join([str(deps / "usr/lib/aarch64-linux-gnu/pkgconfig"),
+                                       str(deps / "usr/share/pkgconfig"), env.get("PKG_CONFIG_PATH", "")])
+    env["LD_LIBRARY_PATH"] = str(deps / "usr/lib/aarch64-linux-gnu")
+    build = root / "build"
+    setup = ["meson", "setup", build, source, "--prefix=" + str(prefix), *OPTIONS]
+    if (build / "build.ninja").exists():
+        setup.insert(2, "--reconfigure")
+        setup.insert(2, "--clearcache")
+    h.run(setup, env=env)
+    h.run(["meson", "compile", "-C", build, "-j", args.jobs], env=env)
+    h.run(["meson", "test", "-C", build, "--print-errorlogs"], env=env)
+    h.run(["meson", "install", "-C", build, "--no-rebuild"], env=env)
+    executable = prefix / "bin/mpv"
+    # These options are part of the receiver's fixed child-process contract.
+    # mpv omits them entirely when compiled without Lua, even when set to "no".
+    startup_option_check = ["--no-config", "--osc=no", "--load-scripts=no", "--ytdl=no", "--version"]
+    version = h.output_with_env([executable, *startup_option_check], env).strip()
+    vo_help = h.output_with_env([executable, "--no-config", "--vo=help"], env)
+    if "dmabuf-wayland" not in vo_help:
+        raise RuntimeError("The built mpv is missing the required dmabuf-wayland output.")
+    manifest = {"installed_source_version": installed, "source_base": SOURCE_BASE,
+                "source_archives": SOURCES, "patches": PATCHES, "mpv": str(executable),
+                "binary_sha256": h.sha256(executable), "configure": [str(arg) for arg in setup],
+                "dependency_lock": str(root / "dependency-lock.json"),
+                "dependency_lock_sha256": h.sha256(root / "dependency-lock.json"),
+                "library_path": env["LD_LIBRARY_PATH"], "version": version,
+                "unit_test_log": str(build / "meson-logs/testlog.json"),
+                "startup_option_check": startup_option_check,
+                "qualification": "Private build and unit tests only; this manifest does not qualify physical playback."}
+    (root / "build-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()

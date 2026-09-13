@@ -22,9 +22,12 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <limits.h>
 
 #include "raop.h"
 #include "airplay_video.h"
+#include "crypto.h"
+#include "compat.h"
 
 typedef enum playlist_type_e {
     NONE,
@@ -50,12 +53,15 @@ struct airplay_video_s {
     char *playback_uuid;
     char *uri_prefix;
     char *local_uri_prefix;
+    char cache_id[33];
     char *playback_location;
     char *language_name;
     char *language_code;
     const char *lang;
     int next_uri;
     int FCUP_RequestID;
+    bool cancelled;
+    char cache_diagnostics[768];
     float start_position_seconds;
     float resume_position_seconds;
     playback_info_t *playback_info;
@@ -100,6 +106,32 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, cons
     airplay_video->num_uri = 0;
     airplay_video->next_uri = 0;
     return airplay_video;
+}
+
+bool airplay_video_enable_scoped_cache(airplay_video_t *video) {
+    if (!video || !video->local_uri_prefix || video->playback_location || video->master_playlist) return false;
+    if (video->cache_id[0]) return true;
+    unsigned char random[16];
+    if (get_random_bytes(random, sizeof(random)) != 1) return false;
+    char id[33];
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); i++) {
+        id[2 * i] = hex[random[i] >> 4];
+        id[2 * i + 1] = hex[random[i] & 15];
+    }
+    id[32] = '\0';
+    size_t length = strlen(video->local_uri_prefix) + strlen("/cache/") + strlen(id) + 1;
+    char *prefix = malloc(length);
+    if (!prefix) return false;
+    snprintf(prefix, length, "%s/cache/%s", video->local_uri_prefix, id);
+    free(video->local_uri_prefix);
+    video->local_uri_prefix = prefix;
+    memcpy(video->cache_id, id, sizeof(id));
+    return true;
+}
+
+const char *airplay_video_get_cache_id(const airplay_video_t *video) {
+    return video && video->cache_id[0] ? video->cache_id : NULL;
 }
 
 // destroy the airplay_video service
@@ -319,6 +351,14 @@ bool airplay_video_is_ready(const airplay_video_t *airplay_video) {
     return true;
 }
 
+void airplay_video_cancel_pending(airplay_video_t *video) {
+    if (video && !airplay_video_is_ready(video)) video->cancelled = true;
+}
+
+bool airplay_video_is_cancelled(const airplay_video_t *video) {
+    return video && video->cancelled;
+}
+
 const char *get_uri_prefix(airplay_video_t *airplay_video) {
     return (const char *) airplay_video->uri_prefix;
 }
@@ -336,7 +376,10 @@ char *get_uri_local_prefix(airplay_video_t *airplay_video) {
 }
 
 int get_next_FCUP_RequestID(airplay_video_t *airplay_video) {    
-    return ++(airplay_video->FCUP_RequestID);
+    if (airplay_video->cache_id[0])
+        airplay_video->FCUP_RequestID = raop_next_scoped_fcup_request_id(airplay_video->raop);
+    else airplay_video->FCUP_RequestID++;
+    return airplay_video->FCUP_RequestID;
 }
 
 int get_current_FCUP_RequestID(const airplay_video_t *airplay_video) {
@@ -358,227 +401,122 @@ void store_master_playlist(airplay_video_t *airplay_video, char *master_playlist
     airplay_video->master_playlist = master_playlist;
 }
 
-typedef struct language_s {
+/* Attribute parsing is shared with cache topology validation below. */
+static char *master_attribute(const char *line, const char *name);
+
+typedef struct {
     const char *start;
-    int len;
-    bool is_default;
-    char code[6];
+    size_t length;
+    char *code;
     char *name;
-} language_t;
+    char *group;
+    bool is_default;
+    bool keep;
+} language_line_t;
 
-language_t* master_playlist_process_language(const char * data, int *slices, int *language_count) {
-    *language_count = 0;
-    const char *ptr = data;
-    int count = 0, count1 = 0;
-    while (ptr) {
-        ptr = strstr(ptr,"#EXT-X-MEDIA:URI=");
-        if(!ptr) {
-            break;
-        }
-        ptr = strstr(ptr, "LANGUAGE=");
-        if(!ptr) {
-            break;
-        }
-        ptr = strstr(ptr,"YT-EXT-AUDIO-CONTENT-ID=");
-        if(!ptr) {
-            break;
-        }
-        count++;
-    }
-    if (count == 0) {
-        return NULL;
-    }
-    language_t *languages = (language_t *) calloc(count + 2, sizeof(language_t));
-    size_t length = 0;
-    ptr = data;
-    for (int i = 1; i <= count; i++) {
-        const char *end;
-        int len_name;
-        if (!(ptr = strstr(ptr, "#EXT-X-MEDIA"))) {
-            break;
-        }
-        if (i == 1) {
-            length = (int) (ptr - data);
-            languages[0].start = data;
-            languages[0].len = length;
-            *languages[0].code = '\0';
-            languages[0].name = NULL;
-        }
-        languages[i].start = ptr;
-
-	    if (!(ptr = strstr(ptr, "DEFAULT="))) {
-            break;
-        }
-	    ptr += strlen("DEFAULT=");
-	    languages[i].is_default = !strncmp(ptr, "YES", strlen("YES"));
-	    if (!(ptr = strstr(ptr, "NAME="))) {
-            break;
-        }
-	    ptr += strlen("NAME=");
-	    end = strchr(++ptr,'"');
-	    if (!end) {
-            break;
-        }
-	    len_name = end - ptr;
-	    languages[i].name = (char *) calloc(len_name + 1, sizeof(char));
-	    memcpy(languages[i].name, ptr, len_name *sizeof(char));
-	    if (!(ptr = strstr(ptr, "LANGUAGE="))) {
-            break;
-        }
-        if (!(ptr = strchr(ptr,'"'))) {
-            break;
-        }
-        if (!(end = strchr(++ptr,'"'))) {
-            break;
-        }
-        strncpy(languages[i].code, ptr, end - ptr);
-        if (!(ptr = strchr(ptr,'\n'))) {
-            break;
-        }
-        count1++;
-        languages[i].len = (int) (ptr + 1 - languages[i].start);
-	    length += languages[i].len;
-    }
-    assert (count1 == count);
-    
-    languages[count + 1].start = ++ptr;
-    languages[count + 1].len = strlen(ptr);
-    *languages[count + 1].code = '\0';
-    languages[count + 1].name = NULL;
-
-    length += languages[count + 1].len;
-    assert(length == strlen(data));
-    *slices = count + 2;
-
-    int copies = 0;
-    for (int i = 1; i < count; i++) {
-        if (!strcmp(languages[i].code, languages[1].code)) {
-            copies++;
-        }
-     }
-
-    *language_count = count/copies;
-    assert(count == *language_count * copies);
-
-    /* verify expected structure of language choice information */
-    for (int i = 1; i <= count; i++) {
-  	int j = i - *language_count;
-        if (j > 0) {
-            assert (!strcmp(languages[i].code, languages[j].code));
-        }
-    }
-    return languages;
+static bool preferred_language(const char *code, const char *preference, size_t length) {
+    return code && length && !strncmp(code, preference, length) &&
+           (!code[length] || code[length] == '-');
 }
 
-char * select_master_playlist_language(airplay_video_t *airplay_video, char *master_playlist) {
-    int language_count, slices;  
-    language_t *languages;
-    assert(master_playlist);
-    if (!(languages = master_playlist_process_language(master_playlist,
-                                                       &slices, &language_count))) {
-        return master_playlist;
+char *select_master_playlist_language(airplay_video_t *video, char *master) {
+    if (!video || !master) return master;
+    size_t count = 0;
+    for (const char *p = master; *p; ) {
+        count++;
+        const char *end = strchr(p, '\n');
+        p = end ? end + 1 : p + strlen(p);
     }
-
-    /* audio is offered in multiple languages */ 
-
-    char *code = NULL;
-    char *name = NULL;
-
-    assert(airplay_video);
-    printf("%d available languages:\n\n", language_count);
-    int i_default = -1;
-    
-    const char *language_name = get_language_name(airplay_video);
-    for (int i = 1; i <= language_count; i ++) {
-        if (language_name) {
-            if (!strcmp(language_name, languages[i].name)) {
-                i_default = i;
+    language_line_t *lines = calloc(count ? count : 1, sizeof(*lines));
+    if (!lines) return master;
+    const char *p = master;
+    size_t choice = count;
+    for (size_t i = 0; i < count; i++) {
+        const char *end = strchr(p, '\n');
+        lines[i].start = p;
+        lines[i].length = end ? (size_t)(end + 1 - p) : strlen(p);
+        lines[i].keep = true;
+        if (!strncmp(p, "#EXT-X-MEDIA:", 13)) {
+            char *text = malloc(lines[i].length + 1);
+            if (text) {
+                memcpy(text, p, lines[i].length);
+                text[lines[i].length] = '\0';
+                text[strcspn(text, "\r\n")] = '\0';
+                char *type = master_attribute(text, "TYPE");
+                if (type && !strcmp(type, "AUDIO")) {
+                    lines[i].code = master_attribute(text, "LANGUAGE");
+                    lines[i].name = master_attribute(text, "NAME");
+                    lines[i].group = master_attribute(text, "GROUP-ID");
+                    char *value = master_attribute(text, "DEFAULT");
+                    lines[i].is_default = value && !strcmp(value, "YES");
+                    free(value);
+                }
+                free(type);
+                free(text);
             }
-        } else if (languages[i].is_default) {
-            i_default = i;
         }
-        printf("%2d %-5.5s \"%s\" %s\n",i, languages[i].code, languages[i].name, (languages[i].is_default ? "(DEFAULT)" : ""));
+        /* Missing optional attributes and arbitrary attribute order are valid.
+         * Keep unclassified lines intact; never infer slices across newlines. */
+        if (lines[i].code && lines[i].code[0] && lines[i].name &&
+            lines[i].name[0] && lines[i].group && lines[i].group[0]) {
+            if (choice == count || (lines[i].is_default && !lines[choice].is_default)) choice = i;
+        }
+        p += lines[i].length;
     }
-    printf("\n");
-    assert(i_default >= 0);
-
-    const char *ptrc = airplay_video->lang;;
-    code = NULL;
-    name = NULL;
-    while (ptrc){
-        for (int i = 1; i <= language_count; i++) {
-            if (!strncmp(languages[i].code, ptrc, 2)) {
-                code = languages[i].code;
-                name = languages[i].name;
-                printf("language choice: %s \"%s\" (based on prefered languages list %s)\n\n",
-                       code, name,  airplay_video->lang);
+    if (video->language_name) {
+        for (size_t i = 0; i < count; i++) {
+            if (lines[i].code && lines[i].code[0] && lines[i].group && lines[i].group[0] &&
+                lines[i].name && !strcmp(lines[i].name, video->language_name)) { choice = i; break; }
+        }
+    }
+    for (const char *preference = video->lang; preference && *preference; ) {
+        const char *end = strchr(preference, ':');
+        size_t length = end ? (size_t)(end - preference) : strlen(preference);
+        bool found = false;
+        for (size_t i = 0; i < count; i++) {
+            if (lines[i].name && lines[i].name[0] && lines[i].group && lines[i].group[0] &&
+                preferred_language(lines[i].code, preference, length)) {
+                choice = i;
+                found = true;
                 break;
             }
         }
-        if (code) {
-            break;
-        }
-        ptrc = strchr(ptrc,':');
-        if(ptrc) {
-            ptrc++;
-            if (strlen(ptrc) < 2) {
-                break;
+        if (found) break;
+        preference = end ? end + 1 : NULL;
+    }
+    if (choice < count) {
+        set_language_name(video, lines[choice].name, strlen(lines[choice].name));
+        set_language_code(video, lines[choice].code, strlen(lines[choice].code));
+        for (size_t i = 0; i < count; i++) {
+            if (!lines[i].code || !lines[i].group || !lines[i].name) continue;
+            size_t selected = i;
+            /* Each rendition group must retain a usable language even when
+             * the requested language is absent from that particular group. */
+            for (size_t j = 0; j < count; j++) {
+                if (!lines[j].code || !lines[j].name || !lines[j].group ||
+                    strcmp(lines[i].group, lines[j].group)) continue;
+                if (!strcmp(lines[j].code, lines[choice].code)) { selected = j; break; }
+                if (lines[j].is_default || j < selected) selected = j;
             }
+            lines[i].keep = !strcmp(lines[i].code, lines[selected].code);
         }
     }
-
-    if (!code) {
-        code = languages[i_default].code;
-        name = languages[i_default].name; 
-        if (airplay_video->lang) {
-            printf("no match with prefered language list %s\n", airplay_video->lang);
+    char *filtered = malloc(strlen(master) + 1);
+    size_t written = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (filtered && lines[i].keep) {
+            memcpy(filtered + written, lines[i].start, lines[i].length);
+            written += lines[i].length;
         }
-        if (language_name) {
-            printf("using HLS-specified language choice: %s \"%s\"\n\n", code, name); 
-        } else {
-            printf("using default language choice: %s \"%s\"\n\n", code, name);
-        }
-    } 
-
-    /* update stored language code, name if changed */
-    if (name != language_name) {   /* compare addresses */
-        size_t len = strlen(name);
-        char *new_language_name = (char *) calloc(len + 1, sizeof(char));
-        char *new_language_code = (char *) calloc(len + 1, sizeof(char));
-        if (!new_language_name || !new_language_code) {
-            printf("Memory allocation failure (new_language_name/code\n");
-            exit (1);
-        }
-        memcpy(new_language_name, name, len);
-        set_language_name(airplay_video, new_language_name, len);
-        len = strlen(code);
-        memcpy(new_language_code, code, len);
-        set_language_code(airplay_video, new_language_code, len);
+        free(lines[i].code);
+        free(lines[i].name);
+        free(lines[i].group);
     }
-    
-    int len = 0;
-    for (int i = 0; i < slices; i++) {
-        if (strlen(languages[i].code) == 0 || !strcmp(languages[i].code, code)) {
-            len += languages[i].len;	
-        }
-    }
-    char *new_master_playlist = (char *) calloc(len + 1, sizeof(char));
-
-    char *ptr = new_master_playlist;
-    for (int i = 0; i < slices; i++) {
-        if (strlen(languages[i].code) == 0 || !strcmp(languages[i].code, code)) {
-            strncpy(ptr, languages[i].start, languages[i].len);
-            ptr += languages[i].len;
-        }
-    }
-
-    for (int i = 1; i <= slices - 2 ; i++) {
-        free (languages[i].name);
-    }
-    free (languages);
-    free (master_playlist);
-    
-    return new_master_playlist;
+    free(lines);
+    if (!filtered) return master;
+    filtered[written] = '\0';
+    free(master);
+    return filtered;
 }
 
 char *get_master_playlist(airplay_video_t *airplay_video) {
@@ -604,7 +542,9 @@ void destroy_media_data_store(airplay_video_t *airplay_video) {
         }
     }
     free (media_data_store);
+    airplay_video->media_data_store = NULL;
     airplay_video->num_uri = 0;
+    airplay_video->next_uri = 0;
 }
 
 void create_media_data_store(airplay_video_t * airplay_video, char ** uri_list, int num_uri) {  
@@ -726,7 +666,7 @@ static bool media_uri_matches(const airplay_video_t *video, const char *stored,
     return path[0] == '/' && requested[0] != '/' && !strcmp(path + 1, requested);
 }
 
-static int available_media_index(const airplay_video_t *video, const char *uri) {
+static int media_reference_index(const airplay_video_t *video, const char *uri, bool cached) {
     if (!video || !video->media_data_store) return -1;
     for (int i = 0; i < video->num_uri; i++) {
         const media_item_t *entry = &video->media_data_store[i];
@@ -734,38 +674,53 @@ static int available_media_index(const airplay_video_t *video, const char *uri) 
             entry->num < 0 || entry->num >= video->num_uri) continue;
         const media_item_t *stored = &video->media_data_store[entry->num];
         if (stored->uri && !strcmp(entry->uri, stored->uri) &&
-            has_playlist_header(stored->playlist)) return entry->num;
+            (!cached || has_playlist_header(stored->playlist))) return entry->num;
     }
     return -1;
 }
 
+static int available_media_index(const airplay_video_t *video, const char *uri) {
+    return media_reference_index(video, uri, true);
+}
+
 /* HLS attribute values may be quoted and contain commas (notably CODECS).
- * Return a copy of exactly one named value, never a substring match. */
-static char *master_attribute(const char *line, const char *name) {
-    const char *p = strchr(line, ':');
+ * Return the bounded, borrowed span of one named value. The wrapper below
+ * copies it for callers that need a null-terminated string. */
+static const char *master_attribute_span(const char *line, size_t length,
+                                        const char *name, size_t *value_length) {
+    const char *end = line + length;
+    const char *p = memchr(line, ':', length);
     if (!p) return NULL;
     p++;
-    while (*p) {
-        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+    while (p < end) {
+        while (p < end && (*p == ',' || *p == ' ' || *p == '\t')) p++;
         const char *key = p;
-        while (*p && *p != '=' && *p != ',') p++;
-        if (*p != '=') return NULL;
+        while (p < end && *p != '=' && *p != ',') p++;
+        if (p == end || *p != '=') return NULL;
         size_t key_len = (size_t) (p - key);
         const char *value = ++p;
-        bool quoted = *p == '"';
+        bool quoted = p < end && *p == '"';
         if (quoted) value = ++p;
-        while (*p && (quoted ? *p != '"' : *p != ',')) p++;
-        if (quoted && *p != '"') return NULL;
+        while (p < end && (quoted ? *p != '"' : *p != ',')) p++;
+        if (quoted && p == end) return NULL;
         size_t len = (size_t) (p - value);
         if (key_len == strlen(name) && !memcmp(key, name, key_len)) {
-            char *copy = calloc(len + 1, 1);
-            if (copy) memcpy(copy, value, len);
-            return copy;
+            *value_length = len;
+            return value;
         }
         if (quoted) p++;
-        if (*p && *p != ',') return NULL;
+        if (p < end && *p != ',') return NULL;
     }
     return NULL;
+}
+
+static char *master_attribute(const char *line, const char *name) {
+    size_t length = 0;
+    const char *value = master_attribute_span(line, strlen(line), name, &length);
+    if (!value) return NULL;
+    char *copy = calloc(length + 1, 1);
+    if (copy) memcpy(copy, value, length);
+    return copy;
 }
 
 typedef struct {
@@ -774,6 +729,7 @@ typedef struct {
     int media_index;
     char *group;
     char *type;
+    unsigned unavailable_route;
 } master_line_t;
 
 static bool available_group(master_line_t *lines, int count,
@@ -833,12 +789,131 @@ static bool h264_codec(const char *codec) {
     return true;
 }
 
-static bool pi4_variant_supported(const char *line) {
+typedef struct {
+    int variants, codec, resolution, frame_rate, routes, groups;
+    int missing_group_type[4];
+    int group_absent, group_http, group_local, group_relative, group_other, group_malformed;
+} cache_rejections_t;
+
+/* Report only fixed categories and counts. Group names, languages and URIs
+ * belong to the sender and must not be copied into ordinary diagnostics. */
+static void count_unavailable_group(master_line_t *lines, int count,
+                                    const char *type, const char *name,
+                                    cache_rejections_t *rejected, size_t type_index) {
+    rejected->missing_group_type[type_index]++;
+    bool declared = false;
+    unsigned routes = 0;
+    for (int i = 0; i < count; i++) {
+        if (lines[i].group && lines[i].type && !strcmp(lines[i].group, name) &&
+            !strcmp(lines[i].type, type)) {
+            declared = true;
+            routes |= lines[i].unavailable_route;
+        }
+    }
+    if (!declared) rejected->group_absent++;
+    if (routes & 1) rejected->group_http++;
+    if (routes & 2) rejected->group_local++;
+    if (routes & 4) rejected->group_relative++;
+    if (routes & 8) rejected->group_other++;
+    if (routes & 16) rejected->group_malformed++;
+}
+
+static bool ascii_name_equal(const char *name, size_t length, const char *expected) {
+    if (length != strlen(expected)) return false;
+    for (size_t i = 0; i < length; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != expected[i]) return false;
+    }
+    return true;
+}
+
+typedef struct {
+    unsigned port;
+    bool loopback;
+} rendition_origin_t;
+
+/* Validate the authority without changing the URI sent to the player. This
+ * also recognizes common loopback spellings of our private cache origin. */
+static bool rendition_http_origin(const char *uri, rendition_origin_t *origin) {
+    const char *colon = strchr(uri, ':');
+    if (!colon || (size_t)(colon - uri) > 5) return false;
+    bool https = ascii_name_equal(uri, (size_t)(colon - uri), "https");
+    if (!https && !ascii_name_equal(uri, (size_t)(colon - uri), "http")) return false;
+    if (strncmp(colon, "://", 3)) return false;
+    for (const unsigned char *p = (const unsigned char *)uri; *p; p++)
+        if (*p <= 32 || *p == 127 || *p == '\\') return false;
+    const char *host = colon + 3;
+    const char *end = host + strcspn(host, "/?#");
+    for (const char *p = host; p < end; p++) if (*p == '@') host = p + 1;
+    if (host == end) return false;
+    const char *port = end;
+    size_t host_length;
+    bool ipv6 = host[0] == '[';
+    if (ipv6) {
+        host++;
+        const char *close = memchr(host, ']', (size_t)(end - host));
+        if (!close || close == host || (close + 1 < end && close[1] != ':')) return false;
+        host_length = (size_t)(close - host);
+        if (close + 1 < end) port = close + 2;
+    } else {
+        const char *separator = memchr(host, ':', (size_t)(end - host));
+        host_length = (size_t)((separator ? separator : end) - host);
+        if (separator) port = separator + 1;
+        for (size_t i = 0; i < host_length; i++) {
+            unsigned char c = host[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return false;
+        }
+    }
+    if (!host_length || host_length >= 256 || (port == end && end[-1] == ':')) return false;
+    origin->port = https ? 443 : 80;
+    if (port != end) {
+        const char *cursor = port;
+        if (!bounded_unsigned(&cursor, 65535, &origin->port) || cursor != end || !origin->port) return false;
+    }
+    char address[256];
+    memcpy(address, host, host_length);
+    address[host_length] = '\0';
+    unsigned char bytes[16];
+    origin->loopback = false;
+    if (ipv6) {
+        if (inet_pton(AF_INET6, address, bytes) != 1) return false;
+        static const unsigned char loopback[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        static const unsigned char mapped[12] = {0,0,0,0,0,0,0,0,0,0,255,255};
+        origin->loopback = !memcmp(bytes, loopback, 16) ||
+                           (!memcmp(bytes, mapped, 12) && bytes[12] == 127);
+    } else {
+        if (host_length && address[host_length - 1] == '.') address[--host_length] = '\0';
+        origin->loopback = ascii_name_equal(address, host_length, "localhost") ||
+                           (inet_pton(AF_INET, address, bytes) == 1 && bytes[0] == 127);
+    }
+    return true;
+}
+
+static unsigned unavailable_rendition_route(const airplay_video_t *video, const char *uri) {
+    const char *colon = strchr(uri, ':');
+    if (colon && (ascii_name_equal(uri, (size_t)(colon - uri), "http") ||
+                  ascii_name_equal(uri, (size_t)(colon - uri), "https"))) {
+        rendition_origin_t origin, receiver;
+        if (!rendition_http_origin(uri, &origin)) return 16;
+        /* The local prefix is constructed by init and optionally gains a
+         * cache path. Validate it here rather than assuming its scheme/size. */
+        if (!video->local_uri_prefix || !rendition_http_origin(video->local_uri_prefix, &receiver)) return 16;
+        return origin.loopback && origin.port == receiver.port ? 2 : 1;
+    }
+    /* A URI without a scheme may be relative to the original master. */
+    if (!colon || colon >= uri + strcspn(uri, "/?#")) return 4;
+    return 8;
+}
+
+static bool pi4_variant_supported(const char *line, cache_rejections_t *rejections) {
     char *codecs = master_attribute(line, "CODECS");
     char *resolution = master_attribute(line, "RESOLUTION");
     char *rate = master_attribute(line, "FRAME-RATE");
-    bool supported = codecs && pi4_resolution_supported(resolution) && pi4_frame_rate_supported(rate) &&
-                     (rate || !strstr(line, "FRAME-RATE="));
+    bool resolution_ok = pi4_resolution_supported(resolution);
+    bool rate_ok = pi4_frame_rate_supported(rate) && (rate || !strstr(line, "FRAME-RATE="));
+    bool supported = codecs != NULL;
     unsigned video_codecs = 0, audio_codecs = 0;
     for (char *p = codecs; supported && p; ) {
         char *comma = strchr(p, ',');
@@ -851,15 +926,21 @@ static bool pi4_variant_supported(const char *line) {
     free(codecs);
     free(resolution);
     free(rate);
-    return supported && video_codecs == 1 && audio_codecs == 1;
+    bool codecs_ok = supported && video_codecs == 1 && audio_codecs == 1;
+    if (!codecs_ok) rejections->codec++;
+    if (!resolution_ok) rejections->resolution++;
+    if (!rate_ok) rejections->frame_rate++;
+    return codecs_ok && resolution_ok && rate_ok;
 }
 
 bool airplay_video_finalize_cache(airplay_video_t *video) {
     return airplay_video_finalize_cache_profile(video, false);
 }
 
-bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
+static bool filter_cache_profile(airplay_video_t *video, bool pi4, bool single, bool cached) {
     if (!video) return false;
+    snprintf(video->cache_diagnostics, sizeof(video->cache_diagnostics),
+             "phase=%s reason=invalid-master-or-routes", cached ? "finalize" : "prepare");
     if (!video->master_playlist && !video->media_data_store &&
         airplay_video_is_ready(video)) return true; /* Direct HTTP playback. */
     if (!has_playlist_header(video->master_playlist) ||
@@ -897,12 +978,21 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
             !strncmp(lines[i].text, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
             char *uri = master_attribute(lines[i].text, "URI");
             if (uri) {
-                lines[i].media_index = available_media_index(video, uri);
+                lines[i].media_index = media_reference_index(video, uri, cached);
                 lines[i].keep = lines[i].media_index >= 0;
+                if (!lines[i].keep) {
+                    lines[i].unavailable_route = unavailable_rendition_route(video, uri);
+                    /* FCUP downloads only the sender's relay URLs. Ordinary
+                     * HTTP(S) audio/subtitle renditions remain fetchable by
+                     * the player and do not need a local cache entry. */
+                    if (!strncmp(lines[i].text, "#EXT-X-MEDIA:", 13) &&
+                        lines[i].unavailable_route == 1) lines[i].keep = true;
+                }
                 free(uri);
             } else if (strstr(lines[i].text, "URI=") ||
                        !strncmp(lines[i].text, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
                 lines[i].keep = false; /* Malformed or missing required URI. */
+                lines[i].unavailable_route = 16;
             }
             if (!strncmp(lines[i].text, "#EXT-X-MEDIA:", 13)) {
                 lines[i].group = master_attribute(lines[i].text, "GROUP-ID");
@@ -915,7 +1005,7 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
             if (!uri) uri = master_attribute(lines[i].text, "SERVER-URI");
             size_t prefix_len = strlen(video->local_uri_prefix);
             if (uri && !strncmp(uri, video->local_uri_prefix, prefix_len) && uri[prefix_len] == '/') {
-                lines[i].media_index = available_media_index(video, uri);
+                lines[i].media_index = media_reference_index(video, uri, cached);
                 if (lines[i].media_index < 0) missing_local_reference = true;
             }
             free(uri);
@@ -923,40 +1013,72 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
     }
 
     int variants = 0;
+    cache_rejections_t rejected = {0};
     for (int i = 0; i < count; i++) {
         if (strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
         lines[i].keep = false;
-        if (pi4 && !pi4_variant_supported(lines[i].text)) continue;
+        rejected.variants++;
+        if (pi4 && !pi4_variant_supported(lines[i].text, &rejected)) continue;
         int uri_line = i + 1;
         while (uri_line < count && !lines[uri_line].text[0]) uri_line++;
-        if (uri_line >= count || lines[uri_line].text[0] == '#') continue;
-        int index = available_media_index(video, lines[uri_line].text);
-        if (index < 0) continue;
+        if (uri_line >= count || lines[uri_line].text[0] == '#') { rejected.routes++; continue; }
+        int index = media_reference_index(video, lines[uri_line].text, cached);
+        if (index < 0) { rejected.routes++; continue; }
         static const char *groups[] = { "AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS" };
         bool playable = true;
         for (size_t group = 0; group < sizeof(groups) / sizeof(groups[0]); group++) {
             char *name = master_attribute(lines[i].text, groups[group]);
             if (name && strcmp(name, "NONE") && !available_group(lines, count, groups[group], name)) {
                 playable = false;
+                count_unavailable_group(lines, count, groups[group], name, &rejected, group);
             }
             free(name);
         }
-        if (!playable) continue;
+        if (!playable) { rejected.groups++; continue; }
         lines[i].keep = true;
         lines[uri_line].keep = true;
         lines[uri_line].media_index = index;
         variants++;
     }
 
+    if (single && variants > 1) {
+        /* Match mpv's default hls-bitrate=max, after unavailable variants and
+         * their dependencies have been removed. Without valid bandwidths,
+         * leave selection to the player instead of guessing quality. */
+        int selected = -1;
+        unsigned highest = 0;
+        bool ranked = true;
+        for (int i = 0; i < count; i++) {
+            if (!lines[i].keep || strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
+            char *bandwidth = master_attribute(lines[i].text, "BANDWIDTH");
+            const char *cursor = bandwidth;
+            unsigned value;
+            bool valid = cursor && bounded_unsigned(&cursor, UINT_MAX, &value) && !*cursor && value > 0;
+            if (!valid) ranked = false;
+            else if (selected < 0 || value > highest) { selected = i; highest = value; }
+            free(bandwidth);
+        }
+        if (ranked && selected >= 0) {
+            for (int i = 0; i < count; i++) {
+                if (i == selected || !lines[i].keep || strncmp(lines[i].text, "#EXT-X-STREAM-INF:", 18)) continue;
+                lines[i].keep = false;
+                int uri_line = i + 1;
+                while (uri_line < count && !lines[uri_line].text[0]) uri_line++;
+                if (uri_line < count) lines[uri_line].keep = false;
+            }
+            variants = 1;
+        }
+    }
+
     if (pi4) {
         /* Do not expose unused HE-AAC/other audio groups from variants removed
          * above. Retain all available tracks within an actively used group. */
         for (int i = 0; i < count; i++) {
-            if (!lines[i].keep || !lines[i].type || strcmp(lines[i].type, "AUDIO")) continue;
+            if (!lines[i].keep || !lines[i].type || (!single && strcmp(lines[i].type, "AUDIO"))) continue;
             bool referenced = false;
             for (int j = 0; j < count && !referenced; j++) {
                 if (!lines[j].keep || strncmp(lines[j].text, "#EXT-X-STREAM-INF:", 18)) continue;
-                char *group = master_attribute(lines[j].text, "AUDIO");
+                char *group = master_attribute(lines[j].text, lines[i].type);
                 referenced = group && lines[i].group && !strcmp(group, lines[i].group);
                 free(group);
             }
@@ -964,6 +1086,17 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
         }
     }
 
+    snprintf(video->cache_diagnostics, sizeof(video->cache_diagnostics),
+             "phase=%s variants=%d retained=%d unsupported_codecs=%d unsupported_resolution=%d "
+             "unsupported_frame_rate=%d unavailable_routes=%d unavailable_groups=%d missing_local_resource=%d "
+             "missing_audio=%d missing_video=%d missing_subtitles=%d missing_captions=%d "
+             "group_absent=%d group_http=%d group_local=%d group_relative=%d group_other=%d group_malformed=%d",
+             cached ? "finalize" : "prepare", rejected.variants, variants, rejected.codec,
+             rejected.resolution, rejected.frame_rate, rejected.routes, rejected.groups, missing_local_reference,
+             rejected.missing_group_type[0], rejected.missing_group_type[1],
+             rejected.missing_group_type[2], rejected.missing_group_type[3], rejected.group_absent,
+             rejected.group_http, rejected.group_local, rejected.group_relative, rejected.group_other,
+             rejected.group_malformed);
     size_t written = 0;
     for (int i = 0; i < count; i++) {
         if (lines[i].keep) {
@@ -1003,10 +1136,28 @@ bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
     free(video->media_data_store);
     video->media_data_store = compact;
     video->num_uri = retained;
-    video->next_uri = retained;
+    video->next_uri = cached ? retained : 0;
     free(video->master_playlist);
     video->master_playlist = filtered;
-    return airplay_video_is_ready(video);
+    return !cached || airplay_video_is_ready(video);
+}
+
+const char *airplay_video_get_cache_diagnostics(const airplay_video_t *video) {
+    return video && video->cache_diagnostics[0] ? video->cache_diagnostics : "reason=unavailable";
+}
+
+bool airplay_video_finalize_cache_profile(airplay_video_t *video, bool pi4) {
+    return filter_cache_profile(video, pi4, false, true);
+}
+
+bool airplay_video_prepare_cache_profile(airplay_video_t *video) {
+    /* Keep every compatible candidate until the downloads establish which
+     * qualities and audio groups are actually available. */
+    return filter_cache_profile(video, true, false, false);
+}
+
+bool airplay_video_finalize_cache_mpv(airplay_video_t *video) {
+    return filter_cache_profile(video, true, true, true);
 }
 
 char * get_media_playlist(airplay_video_t *airplay_video, int *count, float *duration, const char *uri) {
@@ -1046,293 +1197,188 @@ int analyze_media_playlist(char *playlist, float *duration, bool *endlist) {
     return count;
 }
 
-/* parse Master Playlist, make table of Media Playlist uri's that it lists */
+/* Extract complete URI values, including query strings and extensionless
+ * routes. HLS does not require a .m3u8 suffix. Only playlist-bearing tags and
+ * URI lines belong in the FCUP playlist queue; keys and comments do not. */
 int create_media_uri_table(const char *url_prefix, const char *master_playlist_data,
                            int datalen, char ***media_uri_table, int *num_uri) {
-    const char *ptr = strstr(master_playlist_data, url_prefix);
-    char ** table = NULL;
-    if (ptr == NULL) {
-        return -1;
-    }
+    if (!media_uri_table || !num_uri) return -1;
+    *media_uri_table = NULL;
+    *num_uri = 0;
+    if (!url_prefix || !*url_prefix || !master_playlist_data || datalen <= 0 ||
+        memchr(master_playlist_data, '\0', (size_t)datalen)) return -1;
+    char *text = malloc((size_t)datalen + 1);
+    if (!text) return -1;
+    memcpy(text, master_playlist_data, (size_t)datalen);
+    text[datalen] = '\0';
+    char **table = NULL;
+    size_t prefix_length = strlen(url_prefix);
     int count = 0;
-    while (ptr != NULL) {
-        const char *end = strstr(ptr, "m3u8");
-        if (end == NULL) {
-            return 1;
+    for (char *line = text; line && *line; ) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        line[strcspn(line, "\r")] = '\0';
+        char *uri = NULL;
+        if (line[0] && line[0] != '#') {
+            uri = malloc(strlen(line) + 1);
+            if (uri) strcpy(uri, line);
+            else goto error;
+        } else if (!strncmp(line, "#EXT-X-MEDIA:", 13) ||
+                   !strncmp(line, "#EXT-X-I-FRAME-STREAM-INF:", 26)) {
+            uri = master_attribute(line, "URI");
         }
-        end += sizeof("m3u8");
-        count++;
-        ptr = strstr(end, url_prefix);
+        if (uri && !strncmp(uri, url_prefix, prefix_length) && uri[prefix_length] == '/') {
+            char **grown = realloc(table, ((size_t)count + 1) * sizeof(*table));
+            if (!grown) { free(uri); goto error; }
+            table = grown;
+            table[count++] = uri;
+        } else free(uri);
+        line = next;
     }
-    table  = (char **)  calloc(count, sizeof(char *));
-    if (!table) {
-      return -1;
-    }
-    for (int i = 0; i < count; i++) {
-        table[i] = NULL;
-    }
-    ptr = strstr(master_playlist_data, url_prefix);
-    count = 0;
-    while (ptr != NULL) {
-        const char *end = strstr(ptr, "m3u8");
-        char *uri;
-        if (end == NULL) {
-            return 0;
-        }
-        end += sizeof("m3u8");
-        size_t len = end - ptr - 1;
-	    uri  = (char *) calloc(len + 1, sizeof(char));
-        if (!uri) {
-            printf("Memory allocation failure (uri)\n");
-            exit(1);
-        }
-	    memcpy(uri , ptr, len);
-        table[count] = uri;
-        uri =  NULL;	
-	    count ++;
-	    ptr = strstr(end, url_prefix);
-    }
+    free(text);
+    if (!count) { free(table); return -1; }
     *num_uri = count;
-
     *media_uri_table = table;
     return 0;
+ error:
+    for (int i = 0; i < count; i++) free(table[i]);
+    free(table);
+    free(text);
+    return -1;
 }
 
-/* Adjust uri prefixes in the Master Playlist, for sending to the Media Player */
-char *adjust_master_playlist (char *fcup_response_data, int fcup_response_datalen,
-                              const char *uri_prefix, char *uri_local_prefix) {
-    size_t uri_prefix_len = strlen(uri_prefix);
-    size_t uri_local_prefix_len = strlen(uri_local_prefix);
-    int counter = 0;
-    char *ptr = strstr(fcup_response_data, uri_prefix);
-    while (ptr != NULL) {
-        counter++;
-        ptr++;
-        ptr = strstr(ptr, uri_prefix);
-    }
+static bool playlist_append(char **text, size_t *length, size_t *capacity,
+                            const char *data, size_t count);
 
-    size_t len = uri_local_prefix_len - uri_prefix_len;
-    len *= counter;
-    len += fcup_response_datalen;
-    int byte_count = 0;
-    int new_len = (int) len;
-    char *new_master = (char *) malloc(new_len + 1);
-    if (!new_master) {
-        printf("Memory allocation failure (new_master)\n");
-        exit(1);
-    }
-    new_master[new_len] = '\0';
-    char *first = fcup_response_data;
-    char *new = new_master;
-    char *last = strstr(first, uri_prefix);
-    counter  = 0;
-    while (last != NULL) {
-        counter++;
-        len = last - first;
-        memcpy(new, first, len);
-        byte_count += len;
-        first = last + uri_prefix_len;
-        new += len;
-        memcpy(new, uri_local_prefix, uri_local_prefix_len);
-        byte_count += uri_local_prefix_len;
-        new += uri_local_prefix_len;
-        last = strstr(last + uri_prefix_len, uri_prefix);
-        if (last  == NULL) {
-            len = fcup_response_data  + fcup_response_datalen  - first;
-            memcpy(new, first, len);
-            byte_count += len;
-            break;
+/* Rewrite only actual URI starts. A relay-prefix string inside another URL's
+ * query, an unrelated attribute, or a comment is data, not a cache route. */
+char *adjust_master_playlist(char *data, int datalen,
+                             const char *prefix, char *local_prefix) {
+    if (!data || datalen < 0 || !prefix || !*prefix || !local_prefix ||
+        memchr(data, '\0', (size_t)datalen)) return NULL;
+    size_t source_length = (size_t)datalen;
+    size_t prefix_length = strlen(prefix), local_length = strlen(local_prefix);
+    char *result = NULL;
+    size_t written = 0, capacity = 0;
+    for (const char *line = data; line < data + source_length; ) {
+        const char *newline = memchr(line, '\n', (size_t)(data + source_length - line));
+        const char *end = newline ? newline + 1 : data + source_length;
+        size_t length = (size_t)((newline ? newline : end) - line);
+        if (length && line[length - 1] == '\r') length--;
+        const char *values[2] = {NULL, NULL};
+        size_t lengths[2] = {0, 0};
+        if (length && line[0] != '#') {
+            values[0] = line;
+            lengths[0] = length;
+        } else if (length >= 4 && !memcmp(line, "#EXT", 4)) {
+            values[0] = master_attribute_span(line, length, "URI", &lengths[0]);
+            values[1] = master_attribute_span(line, length, "SERVER-URI", &lengths[1]);
+            if (values[1] && (!values[0] || values[1] < values[0])) {
+                const char *swap = values[0]; values[0] = values[1]; values[1] = swap;
+                size_t swap_length = lengths[0]; lengths[0] = lengths[1]; lengths[1] = swap_length;
+            }
         }
+        const char *cursor = line;
+        for (unsigned i = 0; i < 2; i++) {
+            if (!values[i] || lengths[i] <= prefix_length ||
+                memcmp(values[i], prefix, prefix_length) || values[i][prefix_length] != '/') continue;
+            if (!playlist_append(&result, &written, &capacity, cursor, (size_t)(values[i] - cursor)) ||
+                !playlist_append(&result, &written, &capacity, local_prefix, local_length)) goto error;
+            cursor = values[i] + prefix_length;
+        }
+        if (!playlist_append(&result, &written, &capacity, cursor, (size_t)(end - cursor))) goto error;
+        line = end;
     }
-    assert(byte_count == new_len); 
-    return new_master;
+    if (written > INT_MAX) goto error;
+    if (!result) result = calloc(1, 1);
+    return result;
+ error:
+    free(result);
+    return NULL;
+}
+
+/* Append an exact slice with overflow checks. Condensed URLs are untrusted
+ * sender input, so malformed fields must fail the resource, not the receiver. */
+static bool playlist_append(char **text, size_t *length, size_t *capacity,
+                            const char *data, size_t count) {
+    if (count > SIZE_MAX - *length - 1) return false;
+    size_t needed = *length + count + 1;
+    if (needed > *capacity) {
+        size_t grown = *capacity ? *capacity : 256;
+        while (grown < needed) {
+            if (grown > SIZE_MAX / 2) { grown = needed; break; }
+            grown *= 2;
+        }
+        char *replacement = realloc(*text, grown);
+        if (!replacement) return false;
+        *text = replacement;
+        *capacity = grown;
+    }
+    memcpy(*text + *length, data, count);
+    *length += count;
+    (*text)[*length] = '\0';
+    return true;
 }
 
 char *adjust_yt_condensed_playlist(const char *media_playlist) {
-/* this copies a Media Playlist into a null-terminated string. 
-   If it has the "#YT-EXT-CONDENSED-URI" header, it is also expanded into 
-   the full Media Playlist format.
-   It  returns a pointer to the expanded playlist, WHICH MUST BE FREED AFTER USE */
-
-    const char *base_uri_begin;
-    const char *params_begin;
-    const char *prefix_begin;
-    size_t base_uri_len;
-    size_t params_len;
-    size_t prefix_len;
-    const char* ptr = strstr(media_playlist, "#EXTM3U\n");
-
-    ptr += strlen("#EXTM3U\n");
-    assert(ptr);
-    if (strncmp(ptr, "#YT-EXT-CONDENSED-URL", strlen("#YT-EXT-CONDENSED-URL"))) {
-        size_t len = strlen(media_playlist);
-        char * playlist_copy = (char *) malloc(len + 1);
-        if (!playlist_copy) {
-            printf("Memory allocation failure (playlist_copy)\n");
-            exit(1);
-        }
-        memcpy(playlist_copy, media_playlist, len);
-        playlist_copy[len] = '\0';
-        return playlist_copy;
+    if (!has_playlist_header(media_playlist)) return NULL;
+    const char *header = strstr(media_playlist, "#YT-EXT-CONDENSED-URL:");
+    if (!header) {
+        size_t length = strlen(media_playlist);
+        char *copy = malloc(length + 1);
+        if (copy) memcpy(copy, media_playlist, length + 1);
+        return copy;
     }
-    ptr = strstr(ptr, "BASE-URI=");
-    base_uri_begin = strchr(ptr, '"');
-    base_uri_begin++;
-    ptr = strchr(base_uri_begin, '"');
-    base_uri_len = ptr - base_uri_begin;
-    char *base_uri = (char *) calloc(base_uri_len + 1, sizeof(char));
-    assert(base_uri);
-    memcpy(base_uri, base_uri_begin, base_uri_len);  //must free
-
-    ptr = strstr(ptr, "PARAMS=");
-    params_begin = strchr(ptr, '"');
-    params_begin++;
-    ptr = strchr(params_begin,'"');
-    params_len = ptr - params_begin;
-    char *params = (char *) calloc(params_len + 1, sizeof(char));
-    assert(params);
-    memcpy(params, params_begin, params_len);  //must free
-
-    ptr = strstr(ptr, "PREFIX=");
-    prefix_begin = strchr(ptr, '"');
-    prefix_begin++;
-    ptr = strchr(prefix_begin,'"');
-    prefix_len = ptr - prefix_begin;
-    char *prefix = (char *) calloc(prefix_len + 1, sizeof(char));
-    assert(prefix);
-    memcpy(prefix, prefix_begin, prefix_len);  //must free
-
-    /* expand params */
-    int nparams = 0;
-    int *params_size = NULL;
-    const char **params_start = NULL;
-    if (strlen(params)) {
-        nparams = 1;
-        const char * comma = strchr(params, ',');
-        while (comma) {
-            nparams++;
-            comma++;
-            comma = strchr(comma, ',');
-        }
-        params_start = (const char **) calloc(nparams, sizeof(char *));  //must free
-        params_size = (int *)  calloc(nparams, sizeof(int));     //must free
-        if (!params_start || !params_size) {
-            printf("Memory allocation failure (params_start/size)\n");
-            exit(1);
-        }
-        ptr = params;
-        for (int i = 0; i < nparams; i++) {
-            comma = strchr(ptr, ',');
-            params_start[i] = ptr;
-            if (comma) {
-                params_size[i] = (int) (comma - ptr);
-                ptr = comma;
-                ptr++;
+    if (header != media_playlist && header[-1] != '\n') return NULL;
+    size_t header_length = strcspn(header, "\r\n");
+    char *header_line = malloc(header_length + 1);
+    if (!header_line) return NULL;
+    memcpy(header_line, header, header_length);
+    header_line[header_length] = '\0';
+    char *base = master_attribute(header_line, "BASE-URI");
+    char *params = master_attribute(header_line, "PARAMS");
+    char *prefix = master_attribute(header_line, "PREFIX");
+    free(header_line);
+    char *result = NULL;
+    size_t length = 0, capacity = 0;
+    if (!base || !*base || !params || !prefix || !*prefix) goto error;
+    size_t prefix_length = strlen(prefix);
+    for (const char *line = media_playlist; *line; ) {
+        const char *end = strchr(line, '\n');
+        const char *line_end = end ? end : line + strlen(line);
+        const char *content_end = line_end;
+        if (content_end > line && content_end[-1] == '\r') content_end--;
+        size_t line_length = (size_t)(content_end - line);
+        if (line_length && line[0] != '#') {
+            if (line_length < prefix_length || memcmp(line, prefix, prefix_length)) goto error;
+            const char *value = line + prefix_length;
+            if (!playlist_append(&result, &length, &capacity, base, strlen(base))) goto error;
+            if (!*params) {
+                if (!playlist_append(&result, &length, &capacity, value, (size_t)(content_end - value))) goto error;
             } else {
-                params_size[i] = (int) (params + params_len - ptr);
-                break;
+                for (const char *param = params; ; ) {
+                    const char *comma = strchr(param, ',');
+                    size_t param_length = comma ? (size_t)(comma - param) : strlen(param);
+                    const char *value_end = comma ? memchr(value, '/', (size_t)(content_end - value)) : content_end;
+                    if (!param_length || !value_end || value_end == value) goto error;
+                    if (!playlist_append(&result, &length, &capacity, "/", 1) ||
+                        !playlist_append(&result, &length, &capacity, param, param_length) ||
+                        !playlist_append(&result, &length, &capacity, "/", 1) ||
+                        !playlist_append(&result, &length, &capacity, value, (size_t)(value_end - value))) goto error;
+                    if (!comma) break;
+                    param = comma + 1;
+                    value = value_end + 1;
+                }
             }
-        }
+            if (!playlist_append(&result, &length, &capacity, content_end,
+                                 (size_t)((end ? end + 1 : line_end) - content_end))) goto error;
+        } else if (!playlist_append(&result, &length, &capacity, line,
+                                    (size_t)((end ? end + 1 : line_end) - line))) goto error;
+        line = end ? end + 1 : line_end;
     }
-
-    int count = 0;
-    ptr = strstr(media_playlist, "#EXTINF");
-    while (ptr) {
-        count++;
-        ptr = strstr(++ptr, "#EXTINF");
-    }
-
-    size_t old_size = strlen(media_playlist);
-    size_t new_len = old_size;
-    new_len += count * (base_uri_len + params_len);
-
-    int byte_count = 0;
-    char * new_playlist = (char *) malloc(new_len + 1);
-    if (!new_playlist) {
-        printf("Memory allocation failure (new_playlist)\n");
-        exit(1);
-    }
-    new_playlist[new_len] = '\0';
-    const char *old_pos = media_playlist;
-    char *new_pos = new_playlist;
-    ptr = old_pos;
-    ptr = strstr(old_pos, "#EXTINF:");
-    size_t len = ptr - old_pos;
-    /* copy header section before chunks */
-    memcpy(new_pos, old_pos, len);
-    byte_count += len;
-    old_pos += len;
-    new_pos += len;
-    while (ptr) {
-        /* for each chunk */
-        const char *end = NULL;
-        const char *start = strstr(ptr, prefix);
-        len = start - ptr;
-        /* copy first line of chunk entry */
-        memcpy(new_pos, old_pos, len);
-        byte_count += len;
-        old_pos += len;
-        new_pos += len;
-	
-	    /* copy base uri  to replace prefix*/
-        memcpy(new_pos, base_uri, base_uri_len);
-        byte_count += base_uri_len;
-        new_pos += base_uri_len;
-        old_pos += prefix_len;
-        ptr = strstr(old_pos, "#EXTINF:");
-
-        /* insert the PARAMS separators on the slices line  */
-        end = old_pos;
-        int last = nparams - 1;
-        for (int i = 0; i < nparams; i++) {
-            if (i != last) {
-                end = strchr(end, '/');
-            } else {
-                /* the next line starts with either #EXTINF (usually) 
-                or #EXT-X-ENDLIST (at last chunk)*/
-	            end = strstr(end, "#EXT");
-            }
-            *new_pos = '/';
-            byte_count++;
-            new_pos++;
-            memcpy(new_pos, params_start[i], params_size[i]);
-            byte_count += params_size[i];
-            new_pos += params_size[i];
-            *new_pos = '/';
-            byte_count++;
-            new_pos++;
-
-            len = end - old_pos;
-            end++;
-
-            memcpy (new_pos, old_pos, len);
-            byte_count += len;
-            new_pos += len;
-            old_pos += len;
-            if (i != last) {
-                old_pos++; /* last entry is not followed by "/" separator */
-            }
-        }
-    }
-    /* copy tail */
-     
-    len = media_playlist + strlen(media_playlist) - old_pos;
-    memcpy(new_pos, old_pos, len);
-    byte_count += len;
-    new_pos += len;
-    old_pos += len;
-
-    assert(byte_count == (int) new_len);
-
-    free (prefix);
-    free (base_uri);
-    free (params);
-    if (params_size) {
-        free (params_size);
-    }
-    if (params_start) {
-        free (params_start);
-    }  
-
-    return new_playlist;
+    free(base); free(params); free(prefix);
+    return result;
+ error:
+    free(base); free(params); free(prefix); free(result);
+    return NULL;
 }

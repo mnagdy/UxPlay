@@ -1,0 +1,63 @@
+From 2bc3bddfb990065b9d7e6270ee07b3063549f8c2 Mon Sep 17 00:00:00 2001
+From: Dudemanguy <random342@airmail.cc>
+Date: Thu, 10 Apr 2025 15:41:41 -0500
+Subject: [PATCH] vo_dmabuf_wayland: only load needed hardware decoding drivers
+
+The previous way of loading hardware decoding via image formats actually
+loaded more things than needed such as cuda. This is because things like
+cuda do actually support IMGFMT_VAAPI so the request would try to probe
+it and it would fail. Instead of doing that, we can just specifically
+request the only two drivers that we actually care about: vaapi and
+drmprime.
+
+Backport: context-only adjustment for the v0.40.0 reconfig function location.
+Original upstream patch SHA256:
+ea42e92d5e0c7b45a1ff22509b5e72da8a81f630c53356fb4b925e96135a24c5
+---
+ video/out/vo_dmabuf_wayland.c | 24 +++++-------------------
+ 1 file changed, 5 insertions(+), 19 deletions(-)
+
+diff --git a/video/out/vo_dmabuf_wayland.c b/video/out/vo_dmabuf_wayland.c
+index d33bed425f01d..6b38175a83ce9 100644
+--- a/video/out/vo_dmabuf_wayland.c
++++ b/video/out/vo_dmabuf_wayland.c
+@@ -676,14 +676,9 @@ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+         present_sync_get_info(wl->present, info);
+ }
+ 
+-static bool is_supported_fmt(int fmt)
+-{
+-    return (fmt == IMGFMT_DRMPRIME || fmt == IMGFMT_VAAPI);
+-}
+-
+ static int query_format(struct vo *vo, int format)
+ {
+-    return is_supported_fmt(format);
++    return format == IMGFMT_DRMPRIME || format == IMGFMT_VAAPI;
+ }
+ 
+ static int reconfig(struct vo *vo, struct mp_image *img)
+@@ -841,19 +836,10 @@ static int preinit(struct vo *vo)
+         .global = p->global,
+         .ra_ctx = p->ctx,
+     };
+-    ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, NULL, true);
+-
+-    // Loop through hardware accelerated formats and only request known
+-    // supported formats.
+-    for (int i = IMGFMT_VDPAU_OUTPUT; i < IMGFMT_AVPIXFMT_START; ++i) {
+-        if (is_supported_fmt(i)) {
+-            struct hwdec_imgfmt_request params = {
+-                .imgfmt = i,
+-                .probing = false,
+-            };
+-            ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, vo->hwdec_devs, &params);
+-        }
+-    }
++
++    // Initialize all possible hwdec drivers.
++    ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, "vaapi", false);
++    ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, "drmprime", false);
+ 
+     for (int i = 0; i < p->hwdec_ctx.num_hwdecs; i++) {
+         struct ra_hwdec *hw = p->hwdec_ctx.hwdecs[i];

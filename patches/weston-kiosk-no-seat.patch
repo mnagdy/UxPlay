@@ -1,0 +1,31 @@
+From: PiPlay display prototype
+Subject: [EXPERIMENTAL] Restore kiosk root after removal without an input seat
+
+Weston 14.0.2 maps new root surfaces even when no input seat exists, but only
+restores the prior root in the keyboard-focus path. A media appliance without
+input devices must also restore the previous root when the active root exits.
+Keep the existing seat/focus path unchanged; do not activate hidden roots when
+an unrelated hidden client closes.
+
+--- a/kiosk-shell/kiosk-shell.c
++++ b/kiosk-shell/kiosk-shell.c
+@@ -967,6 +967,19 @@
+ 				kiosk_shell_output_set_active_surface_tree(shoutput,
+ 									   NULL);
+ 		}
++	} else if (!seat || !kiosk_seat) {
++		struct kiosk_shell_output *shoutput =
++			kiosk_shell_find_shell_output(shell, shsurf->output);
++
++		if (shoutput && !shsurf->parent &&
++		    shoutput->active_surface_tree == &shsurf->surface_tree_list) {
++			struct kiosk_shell_surface *successor =
++				find_focus_successor(shsurf, NULL);
++			struct kiosk_shell_surface *root = successor ?
++				kiosk_shell_surface_get_parent_root(successor) : NULL;
++
++			kiosk_shell_output_set_active_surface_tree(shoutput, root);
++		}
+ 	}
+ 
+ 	kiosk_shell_surface_destroy(shsurf);

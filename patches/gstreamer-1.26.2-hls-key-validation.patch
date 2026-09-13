@@ -1,0 +1,41 @@
+--- a/ext/adaptivedemux2/hls/gsthlsdemux.c
++++ b/ext/adaptivedemux2/hls/gsthlsdemux.c
+@@ -839,12 +839,36 @@
+     goto out;
+   }
+ 
++  /* A blocking fetch can return a request that completed with an HTTP error.
++   * Never cache an error body or a zero-filled replacement for a missing key. */
++  download_request_lock (key_request);
++  if (key_request->state != DOWNLOAD_REQUEST_STATE_COMPLETE ||
++      key_request->status_code < 200 || key_request->status_code >= 300) {
++    GST_WARNING_OBJECT (demux, "AES-128 key download failed (status=%u)",
++        key_request->status_code);
++    download_request_unlock (key_request);
++    download_request_unref (key_request);
++    goto out;
++  }
+   key_buffer = download_request_take_buffer (key_request);
++  download_request_unlock (key_request);
+   download_request_unref (key_request);
+ 
++  if (key_buffer == NULL || gst_buffer_get_size (key_buffer) != 16) {
++    GST_WARNING_OBJECT (demux, "AES-128 key must contain exactly 16 bytes");
++    if (key_buffer != NULL)
++      gst_buffer_unref (key_buffer);
++    goto out;
++  }
++
+   key = g_new0 (GstHLSKey, 1);
+-  if (gst_buffer_extract (key_buffer, 0, key->data, 16) < 16)
+-    GST_WARNING_OBJECT (demux, "Download decryption key is too short!");
++  if (gst_buffer_extract (key_buffer, 0, key->data, 16) != 16) {
++    GST_WARNING_OBJECT (demux, "Could not read the complete AES-128 key");
++    g_free (key);
++    key = NULL;
++    gst_buffer_unref (key_buffer);
++    goto out;
++  }
+ 
+   g_hash_table_insert (demux->keys, g_strdup (key_url), key);
+ 
